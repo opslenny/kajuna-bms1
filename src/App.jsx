@@ -188,8 +188,6 @@ function App() {
   const [setupRequired, setSetupRequired] = useState(false)
   const [platformOwnerSetupAvailable, setPlatformOwnerSetupAvailable] = useState(false)
   const [platformBusinesses, setPlatformBusinesses] = useState([])
-  const [pendingRegistrations, setPendingRegistrations] = useState([])
-  const [platformSubscriptionPlan, setPlatformSubscriptionPlan] = useState(null)
   const [googleClientId, setGoogleClientId] = useState(null)
   const [googleCredential, setGoogleCredential] = useState('')
   const [registrationProfile, setRegistrationProfile] = useState({ ownerName: '', email: '' })
@@ -198,7 +196,6 @@ function App() {
   const [expandedNavGroup, setExpandedNavGroup] = useState('Dashboard')
   const [modal, setModal] = useState('')
   const [notice, setNotice] = useState('')
-  const noticeTimerRef = useRef(null)
   const [products, setProducts] = useState([])
   const [cart, setCart] = useState([])
   const [transactions, setTransactions] = useState([])
@@ -226,16 +223,6 @@ function App() {
   const posProducts = products.map(productForPos)
   const selectedView = navigationViews[selectedNav] || 'overview'
 
-  useEffect(() => {
-    if (!notice) return undefined
-    window.clearTimeout(noticeTimerRef.current)
-    noticeTimerRef.current = window.setTimeout(() => {
-      setNotice('')
-      noticeTimerRef.current = null
-    }, 5000)
-    return () => window.clearTimeout(noticeTimerRef.current)
-  }, [notice])
-
   const cartTotal = useMemo(
     () => cart.reduce((total, item) => total + item.price * item.qty, 0),
     [cart],
@@ -243,14 +230,8 @@ function App() {
   const refreshWorkspace = useCallback(async (user, rangeName = 'Today', date = todayDate) => {
     if (!user) return
     if (user.role === 'platform_admin') {
-      const [businessResult, requestResult, planResult] = await Promise.all([
-        apiRequest('/platform/businesses'),
-        apiRequest('/platform/registration-requests'),
-        apiRequest('/platform/subscription-plan'),
-      ])
-      setPlatformBusinesses(businessResult.businesses)
-      setPendingRegistrations(requestResult.requests)
-      setPlatformSubscriptionPlan(planResult.plan)
+      const result = await apiRequest('/platform/businesses')
+      setPlatformBusinesses(result.businesses)
       return
     }
     const salesPath = user.role === 'business_admin' && salesDateRef.current
@@ -604,11 +585,12 @@ function App() {
     event.preventDefault()
     const formData = new FormData(event.currentTarget)
     const payload = Object.fromEntries(formData.entries())
-    if (payload.password !== payload.passwordConfirmation) {
-      setLoginError('The passwords do not match.')
+    if (payload.password !== payload.confirmPassword) {
+      setLoginError('Passwords do not match.')
       return
     }
-    delete payload.passwordConfirmation
+    setLoginError('')
+    delete payload.confirmPassword
     try {
       const { user } = await apiRequest('/auth/register-platform-owner', {
         method: 'POST',
@@ -648,51 +630,17 @@ function App() {
     setNotice(`${business.name} and its business data were permanently deleted.`)
   }
 
-  async function reviewRegistration(registration, status) {
-    try {
-      await apiRequest(`/platform/registration-requests/${registration.id}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status }),
-      })
-      await refreshWorkspace(sessionUser)
-      setNotice(`${registration.businessName} registration ${status}.`)
-    } catch (error) {
-      setNotice(error.message)
-    }
-  }
-
-  async function savePlatformSubscriptionPrice(amount) {
-    try {
-      const { plan } = await apiRequest('/platform/subscription-plan', {
-        method: 'PATCH',
-        body: JSON.stringify({ amount }),
-      })
-      setPlatformSubscriptionPlan(plan)
-      const successMessage = `Monthly subscription price changed to ${formatCurrency(plan.amount, plan.currency)} per month. Previous payments remain unchanged.`
-      setNotice(successMessage)
-      try {
-        await refreshWorkspace(sessionUser)
-      } catch (error) {
-        setNotice(`${successMessage} The price was saved, but the owner panel could not refresh: ${error.message}`)
-      }
-    } catch (error) {
-      setNotice(`Subscription price was not changed: ${error.message}`)
-    }
-  }
-
   async function registerBusiness(event) {
     event.preventDefault()
     const formData = new FormData(event.currentTarget)
     const payload = Object.fromEntries(formData.entries())
-    if (googleCredential) {
-      payload.googleCredential = googleCredential
-    } else {
-      if (payload.password !== payload.passwordConfirmation) {
-        setLoginError('The passwords do not match.')
-        return
-      }
-      delete payload.passwordConfirmation
+    if (payload.password && payload.password !== payload.confirmPassword) {
+      setLoginError('Passwords do not match.')
+      return
     }
+    setLoginError('')
+    delete payload.confirmPassword
+    if (googleCredential) payload.googleCredential = googleCredential
     try {
       const result = await apiRequest('/auth/register-business', { method: 'POST', body: JSON.stringify(payload) })
       setGoogleCredential('')
@@ -857,10 +805,10 @@ function App() {
           <div className="login-panel form-panel">
             <div className="auth-form-content" key={authMode}>
             <h2>{isOwnerSetup ? 'Set up system owner' : isRegistering ? 'Register your business' : 'Login'}</h2>
-            {isRegistering && <p className="form-copy">Create a business account to get started.</p>}
-            {isOwnerSetup && <p className="form-copy">Create the private owner account used to manage business access and subscriptions.</p>}
+            {isRegistering && <p className="form-copy">Create a business account to get started. Scroll within this form to complete all details.</p>}
+            {isOwnerSetup && <p className="form-copy">Create the private owner account used to manage business access and subscriptions. Scroll within this form to complete setup.</p>}
             {notice && (
-              <div className="notice-banner" role="status">
+              <div className="login-notice" role="status">
                 <span>{notice}</span>
                 <button type="button" aria-label="Dismiss notification" onClick={() => setNotice('')}>×</button>
               </div>
@@ -877,7 +825,7 @@ function App() {
                   <input type="email" name="email" placeholder="Owner email address" autoComplete="email" required maxLength="254" />
                 </label>
                 <PasswordField label="Password" name="password" placeholder="Create password" autoComplete="new-password" minLength="8" maxLength="128" required />
-                <PasswordField label="Confirm password" name="passwordConfirmation" placeholder="Confirm password" autoComplete="new-password" minLength="8" maxLength="128" required />
+                <PasswordField label="Confirm password" name="confirmPassword" placeholder="Enter password again" autoComplete="new-password" minLength="8" maxLength="128" required />
                 <PasswordField label="First-time setup key" name="setupToken" placeholder="First-time setup key" autoComplete="off" required />
                 <button type="submit" className="primary-button large">Create owner account</button>
               </form>
@@ -907,7 +855,7 @@ function App() {
                   {!googleCredential && (
                     <>
                       <PasswordField label="Password" name="password" placeholder="Create password" autoComplete="new-password" minLength="8" maxLength="128" required />
-                      <PasswordField label="Confirm password" name="passwordConfirmation" placeholder="Confirm password" autoComplete="new-password" minLength="8" maxLength="128" required />
+                      <PasswordField label="Confirm password" name="confirmPassword" placeholder="Enter password again" autoComplete="new-password" minLength="8" maxLength="128" required />
                     </>
                   )}
                   {setupRequired && (
@@ -965,15 +913,11 @@ function App() {
       <OwnerConsole
         user={sessionUser}
         businesses={platformBusinesses}
-        pendingRegistrations={pendingRegistrations}
-        subscriptionPlan={platformSubscriptionPlan}
         notice={notice}
         onDismissNotice={() => setNotice('')}
         onSignOut={signOut}
         onChangeAccess={changeBusinessAccess}
         onDeleteBusiness={deleteCustomerBusiness}
-        onReviewRegistration={reviewRegistration}
-        onSaveSubscriptionPrice={savePlatformSubscriptionPrice}
         onRefresh={() => refreshWorkspace(sessionUser)}
       />
     )
@@ -1358,10 +1302,8 @@ function App() {
   )
 }
 
-function OwnerConsole({ user, businesses, pendingRegistrations, subscriptionPlan, notice, onDismissNotice, onSignOut, onChangeAccess, onDeleteBusiness, onReviewRegistration, onSaveSubscriptionPrice, onRefresh }) {
+function OwnerConsole({ user, businesses, notice, onDismissNotice, onSignOut, onChangeAccess, onDeleteBusiness, onRefresh }) {
   const [businessToDelete, setBusinessToDelete] = useState(null)
-  const [ownerSection, setOwnerSection] = useState('businesses')
-  const [priceSaving, setPriceSaving] = useState(false)
   const attentionCount = businesses.filter((business) => !business.subscriptionStatus || business.subscriptionOverdue).length
   const activeCount = businesses.filter((business) => business.status === 'active').length
   const suspendedCount = businesses.filter((business) => business.status === 'suspended').length
@@ -1380,26 +1322,7 @@ function OwnerConsole({ user, businesses, pendingRegistrations, subscriptionPlan
           <div><strong>KAJUNA</strong><span>BMS · Owner</span></div>
         </div>
         <div className="owner-nav-label">SYSTEM MANAGEMENT</div>
-        <nav className="owner-navigation" aria-label="System owner navigation">
-          <button
-            type="button"
-            className={`owner-nav-item${ownerSection === 'businesses' ? ' active' : ''}`}
-            onClick={() => setOwnerSection('businesses')}
-          >Businesses &amp; subscriptions</button>
-          <button
-            type="button"
-            className={`owner-nav-item${ownerSection === 'pending' ? ' active' : ''}`}
-            onClick={() => setOwnerSection('pending')}
-          >
-            <span>Pending approvals</span>
-            <span className="owner-pending-count">{pendingRegistrations.length}</span>
-          </button>
-          <button
-            type="button"
-            className={`owner-nav-item${ownerSection === 'pricing' ? ' active' : ''}`}
-            onClick={() => setOwnerSection('pricing')}
-          >Monthly subscription price</button>
-        </nav>
+        <div className="owner-nav-item active">Businesses &amp; subscriptions</div>
         <div className="owner-sidebar-account">
           <div className="user-chip">
             <span className="mini-avatar">{user.name.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span>
@@ -1415,26 +1338,16 @@ function OwnerConsole({ user, businesses, pendingRegistrations, subscriptionPlan
         </header>
         {notice && <div className="notice-banner" role="status"><span>{notice}</span><button type="button" aria-label="Dismiss notification" onClick={onDismissNotice}>×</button></div>}
         <section className="page-header">
-          <div>
-            <p className="eyebrow">System owner workspace</p>
-            <h1>{ownerSection === 'pending' ? 'Pending approvals' : ownerSection === 'pricing' ? 'Monthly subscription price' : 'Business access'}</h1>
-            <p className="section-description">
-              {ownerSection === 'pending'
-                ? 'Review new business registrations. Approved owners can sign in to their business dashboard.'
-                : ownerSection === 'pricing'
-                  ? 'Set the monthly Business Growth subscription amount. Business dashboards show the current price converted to each business currency.'
-                  : 'Review businesses using your system and manage access when subscriptions are unpaid.'}
-            </p>
-          </div>
+          <div><p className="eyebrow">System owner workspace</p><h1>Business access</h1><p className="section-description">Review businesses using your system and manage access when subscriptions are unpaid.</p></div>
           <div className="header-status"><span className="status-dot" />Owner access</div>
         </section>
-        {ownerSection === 'businesses' && <section className="stats-grid owner-stats">
+        <section className="stats-grid owner-stats">
           <article className="stat-card blue"><div className="stat-info"><p>Total businesses</p><h3>{businesses.length}</h3></div><span className="stat-delta">Registered</span></article>
           <article className="stat-card green"><div className="stat-info"><p>Active access</p><h3>{activeCount}</h3></div><span className="stat-delta">Can sign in</span></article>
           <article className="stat-card amber"><div className="stat-info"><p>Payment attention</p><h3>{attentionCount}</h3></div><span className="stat-delta">Past due / no plan</span></article>
           <article className="stat-card rose"><div className="stat-info"><p>Suspended</p><h3>{suspendedCount}</h3></div><span className="stat-delta">Access disabled</span></article>
-        </section>}
-        {ownerSection === 'businesses' ? <section className="panel owner-business-panel">
+        </section>
+        <section className="panel owner-business-panel">
           <div className="panel-header">
             <div><p className="eyebrow">Customer accounts</p><h3>Businesses on KAJUNA BMS</h3></div>
             <span className="owner-table-count">{businesses.length} total</span>
@@ -1450,7 +1363,7 @@ function OwnerConsole({ user, businesses, pendingRegistrations, subscriptionPlan
                   return (
                     <tr key={business.id}>
                       <td><div className="owner-business-identity"><strong>{business.name}</strong><span>{business.ownerName || business.email}</span><small>{business.industry} · {business.userCount} users</small></div></td>
-                      <td>{business.planName || '—'}{business.planPrice != null && <small className="owner-period-end">{formatCurrency(business.planPrice, business.planCurrency)} / {business.planBillingPeriod || 'month'}</small>}</td>
+                      <td>{business.planName || '—'}</td>
                       <td><span className={`status-badge ${attention ? 'warning' : 'ok'}`}>{subscription}</span>{business.currentPeriodEnd && <small className="owner-period-end">Through {new Date(business.currentPeriodEnd).toLocaleDateString()}</small>}</td>
                       <td>{business.lastPaymentAt ? <><span className={`status-badge ${business.lastPaymentStatus === 'succeeded' ? 'ok' : 'warning'}`}>{business.lastPaymentStatus || 'Unknown'}</span><small className="owner-period-end">{new Date(business.lastPaymentAt).toLocaleDateString()}</small></> : 'No payment recorded'}</td>
                       <td><span className={`status-badge ${business.status === 'active' ? 'ok' : business.status === 'suspended' ? 'danger' : 'warning'}`}>{business.status}</span></td>
@@ -1477,60 +1390,7 @@ function OwnerConsole({ user, businesses, pendingRegistrations, subscriptionPlan
               </tbody>
             </table>
           </div>
-        </section> : ownerSection === 'pending' ? <section className="panel owner-business-panel">
-          <div className="panel-header">
-            <div><p className="eyebrow">Awaiting review</p><h3>Business registration requests</h3></div>
-            <span className="owner-table-count">{pendingRegistrations.length} pending</span>
-          </div>
-          <div className="table-scroll">
-            <table className="owner-business-table pending-registration-table">
-              <thead><tr><th>Business</th><th>Owner</th><th>Contact</th><th>Industry</th><th>Requested</th><th>Decision</th></tr></thead>
-              <tbody>
-                {pendingRegistrations.map((registration) => (
-                  <tr key={registration.id}>
-                    <td><strong>{registration.businessName}</strong></td>
-                    <td>{registration.ownerName}</td>
-                    <td><span>{registration.email}</span><small className="owner-period-end">{registration.phone}</small></td>
-                    <td>{registration.industry}</td>
-                    <td>{new Date(registration.createdAt).toLocaleString()}</td>
-                    <td>
-                      <div className="owner-business-actions">
-                        <button type="button" className="text-action approval-action" onClick={() => onReviewRegistration(registration, 'approved')}>Approve</button>
-                        <button type="button" className="text-action danger-action" onClick={() => onReviewRegistration(registration, 'rejected')}>Reject</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-                {pendingRegistrations.length === 0 && <tr><td colSpan="6" className="empty-table">There are no pending business registrations.</td></tr>}
-              </tbody>
-            </table>
-          </div>
-        </section> : <section className="panel owner-pricing-panel">
-          <div className="panel-header">
-            <div><p className="eyebrow">Business Growth plan</p><h3>Set the monthly amount</h3></div>
-            {subscriptionPlan && <span className="owner-table-count">{subscriptionPlan.currency} · Monthly</span>}
-          </div>
-          {subscriptionPlan ? <>
-            <p className="section-description">The price is stored in {subscriptionPlan.currency}. Businesses see its equivalent in their selected business currency. Price changes update the current plan price for all subscribers but do not rewrite past payment records.</p>
-            <form className="owner-pricing-form" onSubmit={async (event) => {
-              event.preventDefault()
-              const amount = Number(new FormData(event.currentTarget).get('amount'))
-              setPriceSaving(true)
-              try {
-                await onSaveSubscriptionPrice(amount)
-              } finally {
-                setPriceSaving(false)
-              }
-            }}>
-              <label htmlFor="owner-monthly-price">Monthly amount ({subscriptionPlan.currency})</label>
-              <div className="owner-pricing-input-row">
-                <input id="owner-monthly-price" name="amount" type="number" min="0.01" step="0.01" required defaultValue={subscriptionPlan.amount} />
-                <button type="submit" className="primary-button" disabled={priceSaving}>{priceSaving ? 'Saving…' : 'Save monthly price'}</button>
-              </div>
-              <small>Current price: {formatCurrency(subscriptionPlan.amount, subscriptionPlan.currency)} / month</small>
-            </form>
-          </> : <p className="section-description">The monthly subscription plan could not be loaded. Use Refresh to try again.</p>}
-        </section>}
+        </section>
       </main>
       {businessToDelete && (
         <DeleteBusinessDialog

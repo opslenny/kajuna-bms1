@@ -14,7 +14,11 @@ const { pool } = await import('./db/pool.js')
 const ownerPool = new Pool({ connectionString: process.env.MIGRATION_DATABASE_URL })
 const { createApiApp } = await import('./api.js')
 const app = createApiApp()
-const origin = process.env.APP_ORIGIN || 'http://localhost:5173'
+const allowedOrigins = (process.env.APP_ORIGINS || process.env.APP_ORIGIN || 'http://localhost:5173')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
+const origin = allowedOrigins[0]
 let server
 let baseUrl
 let primaryBusinessId
@@ -91,6 +95,16 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(health.response.status, 200)
   assert.equal(health.payload.status, 'ok')
 
+  const alternateAllowedOrigin = allowedOrigins.find((allowedOrigin) => allowedOrigin !== origin)
+  if (alternateAllowedOrigin) {
+    const allowedOriginMutation = await request('/auth/logout', {
+      method: 'POST',
+      body: '{}',
+      headers: { origin: alternateAllowedOrigin },
+    })
+    assert.equal(allowedOriginMutation.response.status, 401)
+  }
+
   const config = await request('/config')
   assert.equal(config.response.status, 200)
   assert.equal(config.payload.googleClientId, process.env.GOOGLE_CLIENT_ID || null)
@@ -110,6 +124,7 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
       phone: '+255700000001',
       industry: 'Retail',
       password: 'api-test-password-123',
+      confirmPassword: 'api-test-password-123',
       setupToken: process.env.SETUP_TOKEN,
     }),
   })
@@ -118,10 +133,15 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   let adminCookie = registration.cookie
   assert.ok(adminCookie)
   assert.equal((await request('/setup')).payload.setupRequired, false)
-  assert.equal(registration.payload.user.role, 'business_admin')
+  const adminLogin = await request('/auth/login', {
+    ...json('POST', { email: 'api-test-admin@example.invalid', password: 'api-test-password-123' }),
+  })
+  assert.equal(adminLogin.response.status, 200)
+  assert.equal(adminLogin.payload.user.role, 'business_admin')
+  adminCookie = adminLogin.cookie
   const restoredSession = await request('/auth/me', { cookie: adminCookie })
   assert.equal(restoredSession.response.status, 200)
-  assert.equal(restoredSession.payload.user.id, registration.payload.user.id)
+  assert.equal(restoredSession.payload.user.id, adminLogin.payload.user.id)
   const currencyRates = await request('/currency-rates')
   assert.deepEqual(currencyRates.payload.supportedCurrencies, ['TZS', 'KES', 'UGX', 'USD', 'EUR', 'GBP'])
   assert.equal(currencyRates.payload.rates.TZS, 2500)
@@ -184,29 +204,14 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
       phone: '+255700000004',
       industry: 'Services',
       password: 'api-pending-password-123',
+      confirmPassword: 'api-pending-password-123',
     }),
   })
   assert.equal(pendingRegistration.response.status, 202)
-  const pendingLogin = await request('/auth/login', {
-    ...json('POST', { email: 'api-test-pending@example.invalid', password: 'api-pending-password-123' }),
-  })
-  assert.equal(pendingLogin.response.status, 403)
-  assert.match(pendingLogin.payload.error, /pending owner approval/i)
   const { rows: pendingRows } = await ownerPool.query(
     `SELECT status FROM business_registration_requests WHERE email = 'api-test-pending@example.invalid'`,
   )
   assert.equal(pendingRows[0].status, 'pending')
-  const rejectedRegistration = await request('/auth/register-business', {
-    ...json('POST', {
-      businessName: 'API Test Rejected',
-      ownerName: 'API Rejected Owner',
-      email: 'api-test-rejected@example.invalid',
-      phone: '+255700000005',
-      industry: 'Services',
-      password: 'api-rejected-password-123',
-    }),
-  })
-  assert.equal(rejectedRegistration.response.status, 202)
 
   const productResponse = await request('/products', {
     ...json('POST', { name: 'API Test Product', sku: 'API-TEST-1', buyingPrice: 100, sellingPrice: 150, quantity: 8 }),
@@ -483,6 +488,7 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
       name: 'API Test Platform Owner',
       email: 'api-test-platform-owner@example.invalid',
       password: 'api-platform-owner-password-123',
+      confirmPassword: 'api-platform-owner-password-123',
       setupToken: process.env.SETUP_TOKEN,
     }),
   })
@@ -525,88 +531,6 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(platformBusinesses.response.status, 200)
   assert.ok(platformBusinesses.payload.businesses.some((business) => business.id === primaryBusinessId))
   assert.equal((await request('/platform/businesses', { cookie: adminCookie })).response.status, 403)
-  const initialPlan = await request('/platform/subscription-plan', { cookie: ownerCookie })
-  assert.equal(initialPlan.response.status, 200)
-  assert.equal(initialPlan.payload.plan.currency, 'TZS')
-  assert.equal(initialPlan.payload.plan.billingPeriod, 'monthly')
-  assert.equal((await request('/platform/subscription-plan', { cookie: adminCookie })).response.status, 403)
-  assert.equal((await request('/platform/subscription-plan', { cookie: ownerCookie, ...json('PATCH', { amount: 0 }) })).response.status, 400)
-  assert.equal((await request('/platform/subscription-plan', { cookie: ownerCookie, ...json('PATCH', { amount: 0.001 }) })).response.status, 400)
-  assert.equal((await request('/platform/subscription-plan', { cookie: ownerCookie, ...json('PATCH', { amount: 'invalid' }) })).response.status, 400)
-  const { rows: primarySubscription } = await ownerPool.query(
-    'SELECT id FROM subscriptions WHERE business_id = $1 ORDER BY created_at DESC LIMIT 1',
-    [primaryBusinessId],
-  )
-  assert.ok(primarySubscription[0], 'Initial business should have its monthly subscription.')
-  const { rows: historicalPayments } = await ownerPool.query(
-    `INSERT INTO payments (business_id, subscription_id, amount, currency, payment_method, status, paid_at)
-    VALUES ($1, $2, 12345.67, 'TZS', 'cash', 'succeeded', now()) RETURNING id`,
-    [primaryBusinessId, primarySubscription[0].id],
-  )
-  const updatedPlan = await request('/platform/subscription-plan', {
-    ...json('PATCH', { amount: 245678.9 }),
-    cookie: ownerCookie,
-  })
-  assert.equal(updatedPlan.response.status, 200, JSON.stringify(updatedPlan.payload))
-  assert.equal(updatedPlan.payload.plan.amount, 245678.9)
-  const dashboardWithUpdatedPlan = await request('/dashboard', { cookie: adminCookie })
-  assert.equal(dashboardWithUpdatedPlan.response.status, 200)
-  assert.equal(dashboardWithUpdatedPlan.payload.subscription.price, 245678.9)
-  const ownerBusinessesWithUpdatedPlan = await request('/platform/businesses', { cookie: ownerCookie })
-  assert.equal(
-    ownerBusinessesWithUpdatedPlan.payload.businesses.find((business) => business.id === primaryBusinessId).planPrice,
-    245678.9,
-  )
-  const { rows: preservedPayment } = await ownerPool.query(
-    'SELECT amount FROM payments WHERE id = $1',
-    [historicalPayments[0].id],
-  )
-  assert.equal(Number(preservedPayment[0].amount), 12345.67)
-  const { rows: pricingAudit } = await ownerPool.query(
-    `SELECT details FROM audit_logs
-    WHERE action = 'platform_subscription_price_updated' AND entity_id = $1
-    ORDER BY created_at DESC LIMIT 1`,
-    [updatedPlan.payload.plan.id],
-  )
-  assert.equal(Number(pricingAudit[0].details.amount), 245678.9)
-  assert.equal(Number(pricingAudit[0].details.previousAmount), initialPlan.payload.plan.amount)
-  const registrationRequests = await request('/platform/registration-requests', { cookie: ownerCookie })
-  assert.equal(registrationRequests.response.status, 200)
-  assert.equal(registrationRequests.payload.requests.length, 2)
-  assert.equal((await request('/platform/registration-requests', { cookie: adminCookie })).response.status, 403)
-  const pendingApproval = registrationRequests.payload.requests.find((requestRow) => requestRow.email === 'api-test-pending@example.invalid')
-  const pendingRejection = registrationRequests.payload.requests.find((requestRow) => requestRow.email === 'api-test-rejected@example.invalid')
-  const approvedRequest = await request(`/platform/registration-requests/${pendingApproval.id}`, {
-    ...json('PATCH', { status: 'approved' }),
-    cookie: ownerCookie,
-  })
-  assert.equal(approvedRequest.response.status, 200, JSON.stringify(approvedRequest.payload))
-  assert.equal(approvedRequest.payload.status, 'approved')
-  assert.equal(approvedRequest.payload.business.status, 'active')
-  const approvedLogin = await request('/auth/login', {
-    ...json('POST', { email: 'api-test-pending@example.invalid', password: 'api-pending-password-123' }),
-  })
-  assert.equal(approvedLogin.response.status, 200)
-  assert.equal(approvedLogin.payload.user.role, 'business_admin')
-  const approvedDashboard = await request('/dashboard', { cookie: approvedLogin.cookie })
-  assert.equal(approvedDashboard.response.status, 200)
-  assert.equal(approvedDashboard.payload.subscription.price, 245678.9)
-  const { rows: reviewedRequest } = await ownerPool.query(
-    `SELECT status, reviewed_by FROM business_registration_requests WHERE email = 'api-test-pending@example.invalid'`,
-  )
-  assert.equal(reviewedRequest[0].status, 'approved')
-  assert.equal(reviewedRequest[0].reviewed_by, ownerSetup.payload.user.id)
-  const rejectedRequest = await request(`/platform/registration-requests/${pendingRejection.id}`, {
-    ...json('PATCH', { status: 'rejected' }),
-    cookie: ownerCookie,
-  })
-  assert.equal(rejectedRequest.response.status, 200)
-  assert.equal(rejectedRequest.payload.status, 'rejected')
-  const rejectedAccount = await ownerPool.query(
-    'SELECT id FROM users WHERE lower(email) = lower($1)',
-    ['api-test-rejected@example.invalid'],
-  )
-  assert.equal(rejectedAccount.rows.length, 0)
 
   const rejectedDelete = await request(`/platform/businesses/${secondaryBusinessId}`, {
     ...json('DELETE', { password: 'incorrect-owner-password' }),
@@ -626,6 +550,10 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(suspendBusiness.response.status, 200)
   assert.equal(suspendBusiness.payload.business.status, 'suspended')
   assert.equal((await request('/auth/me', { cookie: adminCookie })).response.status, 401)
+  const suspendedLogin = await request('/auth/login', {
+    ...json('POST', { email: 'api-test-admin@example.invalid', password: 'api-test-password-123' }),
+  })
+  assert.equal(suspendedLogin.response.status, 403)
 
   const reactivateBusiness = await request(`/platform/businesses/${primaryBusinessId}`, {
     ...json('PATCH', { status: 'active' }),

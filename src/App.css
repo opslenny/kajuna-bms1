@@ -543,46 +543,12 @@
   letter-spacing: 0.12em;
 }
 
-.owner-navigation {
-  display: grid;
-  gap: 7px;
-}
-
 .owner-nav-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
   padding: 11px 12px;
-  border: 0;
   border-radius: 10px;
-  background: transparent;
-  color: rgba(239, 246, 255, 0.82);
-  font: inherit;
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
-}
-
-.owner-nav-item:hover,
-.owner-nav-item.active {
   background: rgba(255, 255, 255, 0.14);
   color: #fff;
-}
-
-.owner-pending-count {
-  min-width: 24px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: #dbeafe;
-  color: #1e3a8a;
-  font-size: 0.75rem;
-  font-weight: 800;
-  text-align: center;
-}
-
-.approval-action {
-  color: #15803d;
+  font-weight: 700;
 }
 
 .owner-sidebar-account {
@@ -619,42 +585,8 @@
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
 }
 
-.owner-business-panel,
-.owner-pricing-panel {
+.owner-business-panel {
   margin-bottom: 24px;
-}
-
-.owner-pricing-form {
-  display: grid;
-  gap: 10px;
-  max-width: 620px;
-}
-
-.owner-pricing-form > label {
-  color: #334155;
-  font-weight: 700;
-}
-
-.owner-pricing-input-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-
-.owner-pricing-input-row input {
-  box-sizing: border-box;
-  width: min(100%, 280px);
-  min-height: 44px;
-  padding: 10px 12px;
-  border: 1px solid #cbd5e1;
-  border-radius: 9px;
-  background: #fff;
-  color: #0f172a;
-  font: inherit;
-}
-
-.owner-pricing-form > small {
-  color: #64748b;
 }
 
 .owner-table-count {
@@ -1251,28 +1183,16 @@
 }
 
 .notice-banner {
-  position: fixed;
-  z-index: 1000;
-  top: max(16px, env(safe-area-inset-top));
-  right: max(16px, env(safe-area-inset-right));
-  box-sizing: border-box;
-  width: min(420px, calc(100vw - 32px));
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin: 0;
+  margin: 0 0 18px;
   padding: 12px 16px;
   border: 1px solid #bfdbfe;
   border-radius: 12px;
   background: #eff6ff;
   color: #1e3a8a;
-  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
-  animation: notice-popup-in 180ms ease-out;
-}
-
-.notice-banner > span {
-  overflow-wrap: anywhere;
 }
 
 .notice-banner button,
@@ -1282,18 +1202,6 @@
   font-size: 1.4rem;
   line-height: 1;
   cursor: pointer;
-}
-
-@keyframes notice-popup-in {
-  from {
-    opacity: 0;
-    transform: translateY(-8px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 .modal-backdrop {
@@ -1862,15 +1770,6 @@
     width: 100%;
   }
 
-  .owner-pricing-input-row {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .owner-pricing-input-row input {
-    width: 100%;
-  }
-
   .sidebar {
     min-height: auto;
     flex-basis: auto;
@@ -1997,7 +1896,7 @@
 
 .login-shell {
   width: min(960px, 100%);
-  height: min(560px, calc(100vh - 48px));
+  height: min(540px, calc(100vh - 64px));
   min-height: 0;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   border: 0;
@@ -2069,10 +1968,9 @@
 .form-panel {
   position: relative;
   z-index: 1;
-  min-height: 0;
-  overflow: hidden;
   align-items: stretch;
   padding: 44px;
+  overflow: hidden;
 }
 
 .auth-form-content {
@@ -2082,6 +1980,7 @@
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+  scrollbar-color: #94a3b8 transparent;
   animation: auth-content-enter 0.34s ease both;
 }
 
@@ -2274,10 +2173,10 @@
   }
 
   .login-shell {
-    height: auto;
+    height: min(640px, calc(100dvh - 28px));
     min-height: 0;
-    max-height: none;
     grid-template-columns: 1fr;
+    grid-template-rows: 140px minmax(0, 1fr);
   }
 
   .login-panel {
@@ -2286,13 +2185,14 @@
   }
 
   .login-panel {
-    padding: 30px 26px;
+    min-height: 0;
+    padding: 20px 26px;
   }
 
   .brand-panel {
-    min-height: 205px;
+    min-height: 0;
     margin: 0;
-    padding: 30px 26px;
+    padding: 20px 26px;
     border-radius: 24px 24px 38% 38% / 24px 24px 28% 28%;
   }
 
@@ -2309,14 +2209,7 @@
   }
 
   .form-panel {
-    overflow: visible;
-    padding: 30px 26px;
-  }
-
-  .auth-form-content {
-    max-height: none;
-    overflow: visible;
-    scrollbar-gutter: auto;
+    padding: 18px 26px 24px;
   }
 
   .login-shell.register-mode .brand-panel,

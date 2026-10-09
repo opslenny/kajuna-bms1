@@ -50,6 +50,14 @@ function requirePassword(value) {
   return value
 }
 
+function requireConfirmedPassword(body) {
+  const password = requirePassword(body.password)
+  if (typeof body.confirmPassword !== 'string' || body.confirmPassword !== password) {
+    throw new HttpError(400, 'Password confirmation does not match.')
+  }
+  return password
+}
+
 function requireInteger(value, label, { min = 0, max = 2_147_483_647 } = {}) {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') {
     throw new HttpError(400, `${label} must be a whole number between ${min} and ${max}.`)
@@ -365,13 +373,6 @@ const loginLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many sign-in attempts. Try again in 15 minutes.' },
 })
-const registrationLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 10,
-  standardHeaders: 'draft-8',
-  legacyHeaders: false,
-  message: { error: 'Too many registration attempts. Try again in 15 minutes.' },
-})
 const ownerDeleteLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 5,
@@ -465,19 +466,7 @@ api.post('/auth/login', loginLimiter, asyncRoute(async (req, res) => {
     for (const candidate of rows) {
       if (await verifyPassword(password, candidate.password_hash)) matchingAccounts.push(candidate)
     }
-    if (matchingAccounts.length !== 1) {
-      if (rows.length === 0) {
-        const { rows: pendingAccounts } = await client.query(
-          `SELECT password_hash FROM business_registration_requests
-          WHERE lower(email) = $1 AND status = 'pending' LIMIT 1`,
-          [email],
-        )
-        if (pendingAccounts[0] && await verifyPassword(password, pendingAccounts[0].password_hash)) {
-          throw new HttpError(403, 'Your business registration is pending owner approval.')
-        }
-      }
-      throw new HttpError(401, 'Email or password is incorrect.')
-    }
+    if (matchingAccounts.length !== 1) throw new HttpError(401, 'Email or password is incorrect.')
     const account = matchingAccounts[0]
     if (account.status !== 'active' || (account.business_id && account.business_status !== 'active')) {
       throw new HttpError(403, 'This account is currently unavailable. Contact your business administrator.')
@@ -489,11 +478,11 @@ api.post('/auth/login', loginLimiter, asyncRoute(async (req, res) => {
   res.json({ user: result })
 }))
 
-api.post('/auth/register-platform-owner', registrationLimiter, asyncRoute(async (req, res) => {
+api.post('/auth/register-platform-owner', loginLimiter, asyncRoute(async (req, res) => {
   const body = requireObject(req.body)
   const name = requireText(body.name, 'Owner name', { max: 200 })
   const email = requireEmail(body.email)
-  const passwordHash = await hashPassword(requirePassword(body.password))
+  const passwordHash = await hashPassword(requireConfirmedPassword(body))
   if (!compareSecret(body.setupToken, process.env.SETUP_TOKEN)) {
     throw new HttpError(403, 'The first-admin setup key is invalid.')
   }
@@ -586,187 +575,7 @@ api.post('/auth/logout', authenticate, asyncRoute(async (req, res) => {
   res.status(204).end()
 }))
 
-api.get('/platform/registration-requests', authenticate, requireRole('platform_admin'), asyncRoute(async (_req, res) => {
-  const requests = await withDatabaseContext(async (client) => {
-    const { rows } = await client.query(
-      `SELECT id, business_name, owner_name, email, phone, industry, created_at
-      FROM business_registration_requests
-      WHERE status = 'pending'
-      ORDER BY created_at ASC, id ASC`,
-    )
-    return rows.map((row) => ({
-      id: row.id,
-      businessName: row.business_name,
-      ownerName: row.owner_name,
-      email: row.email,
-      phone: row.phone,
-      industry: row.industry,
-      createdAt: row.created_at,
-    }))
-  }, { platformAdmin: true })
-  res.json({ requests })
-}))
-
-api.patch('/platform/registration-requests/:id', authenticate, requireRole('platform_admin'), asyncRoute(async (req, res) => {
-  const id = requireUuid(req.params.id, 'Registration request ID')
-  const body = requireObject(req.body)
-  if (!['approved', 'rejected'].includes(body.status)) {
-    throw new HttpError(400, 'Registration decision must be approved or rejected.')
-  }
-
-  const result = await withDatabaseContext(async (client) => {
-    await client.query("SELECT pg_advisory_xact_lock(hashtext('kajuna-registration:' || $1))", [id])
-    const { rows: requests } = await client.query(
-      `SELECT id, business_name, owner_name, email, phone, industry, password_hash, google_sub
-      FROM business_registration_requests WHERE id = $1 AND status = 'pending' FOR UPDATE`,
-      [id],
-    )
-    const registration = requests[0]
-    if (!registration) throw new HttpError(404, 'Pending registration request not found.')
-
-    if (body.status === 'rejected') {
-      await client.query(
-        `UPDATE business_registration_requests
-        SET status = 'rejected', reviewed_by = $1, reviewed_at = now()
-        WHERE id = $2`,
-        [req.user.id, id],
-      )
-      await client.query(
-        `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details)
-        VALUES (NULL, $1, 'platform_registration_rejected', 'business_registration_request', $2, $3::jsonb)`,
-        [req.user.id, id, JSON.stringify({ email: registration.email, businessName: registration.business_name })],
-      )
-      return { status: 'rejected', requestId: id }
-    }
-
-    const { rows: existingUsers } = await client.query(
-      'SELECT id FROM users WHERE lower(email) = $1 LIMIT 1',
-      [registration.email.toLowerCase()],
-    )
-    if (existingUsers.length) throw new HttpError(409, 'An account already uses this registration email.')
-
-    const { rows: businesses } = await client.query(
-      `INSERT INTO businesses (name, slug, email, phone, industry, status)
-      VALUES ($1, $2, $3, $4, $5, 'active')
-      RETURNING id, name, currency`,
-      [
-        registration.business_name,
-        `${slugify(registration.business_name)}-${randomBytes(3).toString('hex')}`,
-        registration.email,
-        registration.phone,
-        registration.industry,
-      ],
-    )
-    const business = businesses[0]
-    const { rows: users } = await client.query(
-      `INSERT INTO users (business_id, full_name, email, phone, password_hash, role, status, google_sub)
-      VALUES ($1, $2, $3, $4, $5, 'business_admin', 'active', $6)
-      RETURNING id`,
-      [
-        business.id,
-        registration.owner_name,
-        registration.email,
-        registration.phone,
-        registration.password_hash,
-        registration.google_sub,
-      ],
-    )
-    const { rows: plans } = await client.query(
-      "SELECT id FROM subscription_plans WHERE name = 'Business Growth' AND billing_period = 'monthly' AND active = true LIMIT 1",
-    )
-    if (plans[0]) {
-      await client.query(
-        `INSERT INTO subscriptions (business_id, plan_id, status, current_period_end)
-        VALUES ($1, $2, 'active', now() + interval '1 month')`,
-        [business.id, plans[0].id],
-      )
-    }
-    await client.query(
-      `UPDATE business_registration_requests
-      SET status = 'approved', reviewed_by = $1, reviewed_at = now()
-      WHERE id = $2`,
-      [req.user.id, id],
-    )
-    await client.query(
-      `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details)
-      VALUES (NULL, $1, 'platform_registration_approved', 'business', $2, $3::jsonb)`,
-      [req.user.id, business.id, JSON.stringify({ requestId: id, email: registration.email })],
-    )
-    return {
-      status: 'approved',
-      requestId: id,
-      business: { id: business.id, name: business.name, ownerId: users[0].id, status: 'active' },
-    }
-  }, { platformAdmin: true })
-
-  res.json(result)
-}))
-
-api.get('/platform/subscription-plan', authenticate, requireRole('platform_admin'), asyncRoute(async (_req, res) => {
-  const plan = await withDatabaseContext(async (client) => {
-    const { rows } = await client.query(
-      `SELECT id, name, price, currency, billing_period
-      FROM subscription_plans
-      WHERE name = 'Business Growth' AND billing_period = 'monthly' AND active = true
-      LIMIT 1`,
-    )
-    if (!rows[0]) throw new HttpError(503, 'The monthly subscription plan is not configured.')
-    return {
-      id: rows[0].id,
-      name: rows[0].name,
-      amount: Number(rows[0].price),
-      currency: rows[0].currency,
-      billingPeriod: rows[0].billing_period,
-    }
-  }, { platformAdmin: true })
-  res.json({ plan })
-}))
-
-api.patch('/platform/subscription-plan', authenticate, requireRole('platform_admin'), asyncRoute(async (req, res) => {
-  const body = requireObject(req.body)
-  const amount = requireAmount(body.amount, 'Monthly subscription amount', { min: 0, exclusiveMin: true })
-  if (amount < 0.01) throw new HttpError(400, 'Monthly subscription amount must be at least 0.01.')
-  const plan = await withDatabaseContext(async (client) => {
-    const { rows: currentRows } = await client.query(
-      `SELECT id, name, price, currency, billing_period
-      FROM subscription_plans
-      WHERE name = 'Business Growth' AND billing_period = 'monthly' AND active = true
-      LIMIT 1 FOR UPDATE`,
-    )
-    if (!currentRows[0]) throw new HttpError(503, 'The monthly subscription plan is not configured.')
-    const { rows } = await client.query(
-      `UPDATE subscription_plans SET price = $1 WHERE id = $2
-      RETURNING id, name, price, currency, billing_period`,
-      [amount, currentRows[0].id],
-    )
-    const updatedPlan = {
-      id: rows[0].id,
-      name: rows[0].name,
-      amount: Number(rows[0].price),
-      currency: rows[0].currency,
-      billingPeriod: rows[0].billing_period,
-    }
-    await client.query(
-      `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details)
-      VALUES (NULL, $1, 'platform_subscription_price_updated', 'subscription_plan', $2, $3::jsonb)`,
-      [
-        req.user.id,
-        updatedPlan.id,
-        JSON.stringify({
-          previousAmount: Number(currentRows[0].price),
-          amount: updatedPlan.amount,
-          currency: updatedPlan.currency,
-          billingPeriod: updatedPlan.billingPeriod,
-        }),
-      ],
-    )
-    return updatedPlan
-  }, { platformAdmin: true })
-
-  res.json({ plan })
-}))
-
-api.post('/auth/register-business', registrationLimiter, asyncRoute(async (req, res) => {
+api.post('/auth/register-business', loginLimiter, asyncRoute(async (req, res) => {
   const body = requireObject(req.body)
   const name = requireText(body.businessName, 'Business name', { max: 150 })
   const googleIdentity = body.googleCredential ? await verifyGoogleCredential(body.googleCredential) : null
@@ -776,7 +585,7 @@ api.post('/auth/register-business', registrationLimiter, asyncRoute(async (req, 
   const industry = requireText(body.industry, 'Business type', { max: 100 })
   const passwordHash = googleIdentity && !body.password
     ? await hashPassword(randomBytes(48).toString('base64url'))
-    : await hashPassword(requirePassword(body.password))
+    : await hashPassword(requireConfirmedPassword(body))
 
   if (body.setupToken) {
     if (!compareSecret(body.setupToken, process.env.SETUP_TOKEN)) throw new HttpError(403, 'The first-admin setup key is invalid.')
@@ -804,7 +613,7 @@ api.post('/auth/register-business', registrationLimiter, asyncRoute(async (req, 
       )
       const userRow = { ...users[0], business_name: business.name, currency: business.currency }
       const { rows: plans } = await client.query(
-        "SELECT id FROM subscription_plans WHERE name = 'Business Growth' AND billing_period = 'monthly' AND active = true LIMIT 1",
+        "SELECT id FROM subscription_plans WHERE name = 'Business Growth' AND active = true LIMIT 1",
       )
       if (plans[0]) {
         await client.query(
@@ -840,8 +649,7 @@ api.get('/platform/businesses', authenticate, requireRole('platform_admin'), asy
       `SELECT b.id, b.name, b.email, b.phone, b.industry, b.status, b.created_at,
         owner.full_name AS owner_name, owner.email AS owner_email,
         coalesce(member_counts.user_count, 0)::integer AS user_count,
-        subscription.plan_name, subscription.plan_price, subscription.plan_currency,
-        subscription.billing_period, subscription.subscription_status, subscription.current_period_end,
+        subscription.plan_name, subscription.subscription_status, subscription.current_period_end,
         (subscription.subscription_status IN ('past_due', 'expired', 'cancelled')
           OR subscription.current_period_end <= now()) AS subscription_overdue,
         payment.payment_status AS last_payment_status, payment.paid_at AS last_payment_at
@@ -855,8 +663,7 @@ api.get('/platform/businesses', authenticate, requireRole('platform_admin'), asy
         SELECT count(*)::integer AS user_count FROM users WHERE business_id = b.id
       ) member_counts ON true
       LEFT JOIN LATERAL (
-        SELECT p.name AS plan_name, p.price AS plan_price, p.currency AS plan_currency,
-          p.billing_period, s.status AS subscription_status, s.current_period_end
+        SELECT p.name AS plan_name, s.status AS subscription_status, s.current_period_end
         FROM subscriptions s
         JOIN subscription_plans p ON p.id = s.plan_id
         WHERE s.business_id = b.id
@@ -881,9 +688,6 @@ api.get('/platform/businesses', authenticate, requireRole('platform_admin'), asy
       ownerEmail: row.owner_email,
       userCount: row.user_count,
       planName: row.plan_name,
-      planPrice: row.plan_price == null ? null : Number(row.plan_price),
-      planCurrency: row.plan_currency,
-      planBillingPeriod: row.billing_period,
       subscriptionStatus: row.subscription_status,
       currentPeriodEnd: row.current_period_end,
       subscriptionOverdue: row.subscription_overdue,
@@ -1729,8 +1533,11 @@ export function createApiApp() {
   app.use(express.json({ limit: '32kb', strict: true }))
   app.use((req, res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-      const allowedOrigin = process.env.APP_ORIGIN || 'http://localhost:5173'
-      if (req.get('origin') !== allowedOrigin) return res.status(403).json({ error: 'Request origin is not allowed.' })
+      const allowedOrigins = (process.env.APP_ORIGINS || process.env.APP_ORIGIN || 'http://localhost:5173')
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter(Boolean)
+      if (!allowedOrigins.includes(req.get('origin'))) return res.status(403).json({ error: 'Request origin is not allowed.' })
       const hasBody = Number(req.get('content-length') || 0) > 0 || Boolean(req.get('transfer-encoding'))
       if (hasBody && !req.is('application/json')) return res.status(415).json({ error: 'Requests must use application/json.' })
     }
