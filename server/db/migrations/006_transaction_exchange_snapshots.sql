@@ -1,0 +1,15 @@
+ALTER TABLE sales
+  ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(24, 16),
+  ADD COLUMN IF NOT EXISTS converted_total NUMERIC(14, 2),
+  ADD COLUMN IF NOT EXISTS converted_currency CHAR(3),
+  ADD COLUMN IF NOT EXISTS exchange_rates JSONB,
+  ADD COLUMN IF NOT EXISTS fx_rate_updated_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS fx_rate_is_stale BOOLEAN NOT NULL DEFAULT false;
+
+ALTER TABLE expenses
+  ADD COLUMN IF NOT EXISTS exchange_rate NUMERIC(24, 16),
+  ADD COLUMN IF NOT EXISTS converted_amount NUMERIC(14, 2),
+  ADD COLUMN IF NOT EXISTS converted_currency CHAR(3),
+  ADD COLUMN IF NOT EXISTS exchange_rates JSONB,
+  ADD COLUMN IF NOT EXISTS fx_rate_updated_at TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS fx_rate_is_stale BOOLEAN NOT NULL DEFAULT false;

@@ -1,0 +1,2 @@
+ALTER TABLE subscription_plans
+  ADD COLUMN IF NOT EXISTS currency CHAR(3) NOT NULL DEFAULT 'TZS';
