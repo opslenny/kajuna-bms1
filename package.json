@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "db:check": "node server/db/check.js",
     "db:migrate": "node server/db/migrate.js",
+    "owner:reset-password": "node server/scripts/reset-owner-password.js",
     "test:api": "node server/test-api.js",
     "test": "node server/test-api.js"
   },

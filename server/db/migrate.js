@@ -17,6 +17,13 @@ const migrations = [
   ['004_money_currencies', new URL('./migrations/004_money_currencies.sql', import.meta.url)],
   ['005_subscription_plan_currency', new URL('./migrations/005_subscription_plan_currency.sql', import.meta.url)],
   ['006_transaction_exchange_snapshots', new URL('./migrations/006_transaction_exchange_snapshots.sql', import.meta.url)],
+  ['007_business_approval_management', new URL('./migrations/007_business_approval_management.sql', import.meta.url)],
+  ['008_business_account_management', new URL('./migrations/008_business_account_management.sql', import.meta.url)],
+  ['009_customer_debts', new URL('./migrations/009_customer_debts.sql', import.meta.url)],
+  ['010_subscription_period_snapshots', new URL('./migrations/010_subscription_period_snapshots.sql', import.meta.url)],
+  ['011_business_branding', new URL('./migrations/011_business_branding.sql', import.meta.url)],
+  ['012_user_preferences', new URL('./migrations/012_user_preferences.sql', import.meta.url)],
+  ['013_dark_dashboard_default', new URL('./migrations/013_dark_dashboard_default.sql', import.meta.url)],
 ]
 const pool = new Pool({
   connectionString: migrationConnectionString,

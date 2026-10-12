@@ -28,6 +28,7 @@ try {
   databaseCreated = true
   process.env.DATABASE_URL = testApplicationUrl.toString()
   process.env.MIGRATION_DATABASE_URL = testMigrationUrl.toString()
+  process.env.AUTH_RATE_LIMIT_MAX = process.env.AUTH_RATE_LIMIT_MAX || '1000'
   const { Pool: TestPool } = pg
   const ownerPool = new TestPool({ connectionString: testMigrationUrl.toString(), connectionTimeoutMillis: 5_000 })
   const appRole = decodeURIComponent(testApplicationUrl.username)
