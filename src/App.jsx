@@ -2297,13 +2297,21 @@ function App() {
                 <button
                   type="button"
                   className="nav-group-toggle"
-                  aria-expanded={expandedNavGroup === group.title}
-                  onClick={() => setExpandedNavGroup((current) => current === group.title ? '' : group.title)}
+                  aria-expanded={expandedNavGroup === group.title || group.title === 'Reports'}
+                  onClick={() => {
+                    setExpandedNavGroup((current) => current === group.title ? '' : group.title)
+                    if (group.title === 'Reports') {
+                      setReportType('monthly')
+                      setMonthlyReportOpen(true)
+                      setReportData(null)
+                      setReportError('')
+                    }
+                  }}
                 >
                   <span><span className="nav-group-icon" aria-hidden="true"><GroupNavIcon title={group.title} /></span>{t(group.title)}</span><span className="nav-chevron" aria-hidden="true">⌄</span>
                 </button>
               </h2>
-              {expandedNavGroup === group.title && (
+              {(expandedNavGroup === group.title || group.title === 'Reports') && (
                 <ul>
                   {group.items.map((item) => (
                     <li key={item}>
