@@ -2378,6 +2378,7 @@ function App() {
             </details>
             {selectedView === 'transactions' && <button type="button" className="ghost-button" onClick={exportTransactions}>{t('Export')}</button>}
             {selectedView === 'sales' && <button type="button" className="primary-button" onClick={() => openSection('New Sale / POS')}>{t('+ Add Sale')}</button>}
+            {sessionUser?.role === 'business_admin' && <button type="button" className="ghost-button" onClick={() => { setReportType('monthly'); setMonthlyReportOpen(true); setReportData(null); setReportError('') }}>{t('Reports')}</button>}
           </div>
         </header>
 
