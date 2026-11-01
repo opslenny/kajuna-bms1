@@ -6062,3 +6062,57 @@
   #monthly-report-print { position: absolute; left: 0; top: 0; width: 100%; }
 }
 
+
+
+.overview-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+}
+.overview-business-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 700;
+  font-size: clamp(1rem, 4vw, 1.25rem);
+  color: var(--dashboard-text, #eef4fb);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.overview-date-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.date-filter-icon {
+  color: var(--dashboard-muted, #8d9bae);
+  font-size: 14px;
+}
+.header-date-filter {
+  width: 125px;
+  max-width: 145px;
+  height: 38px;
+  min-height: 38px;
+  padding: 0 8px;
+  font-size: 13px;
+  border-radius: 8px;
+  border: 1px solid var(--dashboard-border, rgba(148, 163, 184, 0.14));
+  background: var(--dashboard-card-raised, #172230);
+  color: var(--dashboard-text, #eef4fb);
+  appearance: none;
+  -webkit-appearance: none;
+}
+.header-date-filter:focus {
+  outline: none;
+  border-color: rgba(59, 130, 246, 0.5);
+}
+@media (max-width: 420px) {
+  .header-date-filter { width: 118px; font-size: 12px; }
+  .overview-business-name { font-size: 0.95rem; }
+}
+@media (min-width: 768px) {
+  .header-date-filter { width: 140px; }
+}

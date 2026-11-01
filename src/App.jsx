@@ -2375,20 +2375,21 @@ function App() {
             <h1>{selectedView === 'overview' ? t('Dashboard') : t(selectedNav)}</h1>
           </div>
           {selectedView === 'overview' && (
-            <div className="header-status">
-              <span className="status-dot" />{business?.name || sessionUser.businessName}
-              <span aria-hidden="true" className="date-filter-icon">📅</span>
-              <select
-                aria-label={t('Financial overview date range')}
-                value={chartRange}
-                onChange={(event) => {
-                  const value = event.target.value
-                  if (value === 'custom') loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)
-                  else loadDashboardChart(value, todayDate)
-                }}
-                disabled={chartLoading}
-                className="header-date-filter"
-              >
+            <div className="overview-title-row">
+              <span className="overview-business-name">{business?.name || sessionUser.businessName}</span>
+              <div className="overview-date-filter">
+                <span aria-hidden="true" className="date-filter-icon">📅</span>
+                <select
+                  aria-label={t('Financial overview date range')}
+                  value={chartRange}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    if (value === 'custom') loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)
+                    else loadDashboardChart(value, todayDate)
+                  }}
+                  disabled={chartLoading}
+                  className="header-date-filter"
+                >
                 <option value="today">{t('Today')}</option>
                 <option value="yesterday">{t('Yesterday')}</option>
                 <option value="thisWeek">{t('This Week')}</option>
@@ -2399,6 +2400,7 @@ function App() {
                 <option value="thisYear">{t('This Year')}</option>
                 <option value="custom">{t('Custom Date Range')}</option>
               </select>
+            </div>
             </div>
           )}
         </section>
