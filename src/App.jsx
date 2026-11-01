@@ -1139,6 +1139,7 @@ function App() {
       }
       const result = await apiRequest(url)
       setReportData(result)
+      await downloadReportPdf({ reportData: result, reportType, reportCustomStart, reportCustomEnd, setNotice, setReportError, setReportDownloading })
       return result
     } catch (error) {
       setReportError(error.message)
@@ -2221,7 +2222,7 @@ function App() {
                     </label>
                   </>
                 )}
-                <button type="button" className="primary-button small" onClick={async () => { const r = await loadMonthlyReport(); if (r) await downloadReportPdf({ reportData: r, reportType, reportCustomStart, reportCustomEnd, setNotice, setReportError, setReportDownloading }) }} disabled={reportLoading || reportDownloading}>{reportLoading ? t('Loading…') : t('Generate Report')}</button>
+                <button type="button" className="primary-button small" onClick={loadMonthlyReport} disabled={reportLoading || reportDownloading}>{reportLoading ? t('Loading…') : t('Generate Report')}</button>
               </div>
               {reportError && <p className="dashboard-chart-error" role="alert">{reportError}</p>}
               {reportData && (
