@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
+import { motion, useReducedMotion } from 'motion/react'
+import { Boxes, ChartNoAxesCombined, CreditCard, LayoutDashboard, Package, Receipt, RefreshCw, Search, Settings2, ShoppingCart, Users, WalletCards, X } from 'lucide-react'
 import './App.css'
 import { translate } from './i18n.js'
+import UnifiedSidebar from './components/UnifiedSidebar.jsx'
 
 const navigation = [
   { title: 'Dashboard', items: ['Overview', 'Performance', 'Reports'] },
+  { title: 'Reports', items: ['Monthly Financial Reports', 'Custom Date-Range Reports', 'Generated Reports'] },
   { title: 'Products', items: ['All Products', 'Add Product', 'Categories'] },
   { title: 'Inventory', items: ['Stock', 'Stock Adjustments', 'Low Stock'] },
   { title: 'Sales', items: ['New Sale / POS', 'Sales History', 'Receipts'] },
@@ -20,6 +24,9 @@ const navigationViews = {
   Overview: 'overview',
   Performance: 'performance',
   Reports: 'transactions',
+  'Monthly Financial Reports': 'overview',
+  'Custom Date-Range Reports': 'overview',
+  'Generated Reports': 'overview',
   'All Products': 'products',
   'Add Product': 'products',
   Categories: 'products',
@@ -47,17 +54,22 @@ const navigationViews = {
   'System Settings': 'settings',
 }
 
-const navigationIcons = {
-  Dashboard: '◫',
-  Products: '▦',
-  Inventory: '▤',
-  Sales: '↗',
-  Expenses: '−',
-  Debts: '◉',
-  Reports: '▥',
-  Users: '♙',
-  Subscription: '◇',
-  Settings: '⚙',
+const navigationIconComponents = {
+  Dashboard: LayoutDashboard,
+  Products: Package,
+  Inventory: Boxes,
+  Sales: ShoppingCart,
+  Expenses: WalletCards,
+  Debts: Receipt,
+  Reports: ChartNoAxesCombined,
+  Users,
+  Subscription: CreditCard,
+  Settings: Settings2,
+}
+
+function GroupNavIcon({ title }) {
+  const Icon = navigationIconComponents[title] || LayoutDashboard
+  return <Icon size={16} strokeWidth={1.8} />
 }
 
 function PreferenceControls({ theme, language, onThemeChange, onLanguageChange }) {
@@ -79,13 +91,15 @@ function PreferenceControls({ theme, language, onThemeChange, onLanguageChange }
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.9 13A8.5 8.5 0 0 1 11 3.1 8.5 8.5 0 1 0 20.9 13Z" /></svg>
         )}
       </button>
-      <label className="language-select">
-        <span className="sr-only">{t('Language')}</span>
-        <select value={language} onChange={(event) => onLanguageChange(event.target.value)} aria-label={t('Language')}>
-          <option value="en">English</option>
-          <option value="sw">Kiswahili</option>
-        </select>
-      </label>
+            <button
+        type="button"
+        className="language-switch"
+        aria-label={t('Language')}
+        title={t('Language')}
+        onClick={() => onLanguageChange(language === 'en' ? 'sw' : 'en')}
+      >
+        {language === 'en' ? 'EN' : 'SW'}
+      </button>
     </div>
   )
 }
@@ -155,7 +169,119 @@ const metricCards = [
   { label: 'Cash Flow', key: 'cashFlow', tone: 'teal', icon: '⇄' },
 ]
 
+function getMetricComparison(currentValue, previousValue, metricKey, language) {
+  if (!Number.isFinite(previousValue) || previousValue === 0) {
+    return { label: translate('No prior-period data', language), tone: 'neutral' }
+  }
+  const change = ((currentValue - previousValue) / Math.abs(previousValue)) * 100
+  if (Math.abs(change) < 0.05) return { label: translate('No change vs previous month', language), tone: 'neutral' }
+  const favorable = metricKey === 'expenses' ? change < 0 : change > 0
+  const formatted = new Intl.NumberFormat(language === 'sw' ? 'sw-TZ' : 'en-TZ', {
+    maximumFractionDigits: 1,
+    signDisplay: 'always',
+  }).format(change)
+  return {
+    label: `${formatted}% ${translate('vs previous month', language)}`,
+    tone: favorable ? 'positive' : 'negative',
+  }
+}
+
 const supportedCurrencies = ['TZS', 'KES', 'UGX', 'USD', 'EUR', 'GBP']
+const supportedImageMimeTypes = ['image/png', 'image/jpeg', 'image/webp']
+const maxImageBytes = 5 * 1024 * 1024
+
+function UserAvatar({ user, className = 'mini-avatar' }) {
+  const initials = user?.name?.split(' ').map((part) => part[0]).join('').slice(0, 2) || '?'
+  return (
+    <span className={`${className}${user?.profileImageUpdatedAt ? ' has-profile-image' : ''}`}>
+      {user?.profileImageUpdatedAt
+        ? <img src={`/api/auth/profile-image?v=${encodeURIComponent(user.profileImageUpdatedAt)}`} alt="" />
+        : initials}
+    </span>
+  )
+}
+
+function ProfileImageControl({ user, language, onUpdated, onNotice }) {
+  const t = (text) => translate(text, language)
+  const [file, setFile] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const inputRef = useRef(null)
+  const previewUrl = useMemo(() => file ? URL.createObjectURL(file) : '', [file])
+
+  useEffect(() => () => {
+    if (previewUrl) URL.revokeObjectURL(previewUrl)
+  }, [previewUrl])
+
+  function selectImage(event) {
+    const selected = event.currentTarget.files?.[0]
+    event.currentTarget.value = ''
+    if (!selected) return
+    if (!supportedImageMimeTypes.includes(selected.type)) {
+      onNotice(t('Choose a JPG, PNG, or WebP image.'))
+      return
+    }
+    if (selected.size > maxImageBytes) {
+      onNotice(t('Images must be no larger than 5 MB.'))
+      return
+    }
+    setFile(selected)
+  }
+
+  async function saveImage() {
+    if (!file) return
+    setBusy(true)
+    try {
+      const result = await apiRequest('/auth/profile-image', {
+        method: 'PUT',
+        body: file,
+        headers: { 'Content-Type': file.type },
+      })
+      setFile(null)
+      onUpdated(result.profileImageUpdatedAt)
+      onNotice(t('Profile photo updated.'))
+    } catch (error) {
+      onNotice(t(error.message))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeImage() {
+    setBusy(true)
+    try {
+      await apiRequest('/auth/profile-image', { method: 'DELETE' })
+      setFile(null)
+      onUpdated(null)
+      onNotice(t('Profile photo removed.'))
+    } catch (error) {
+      onNotice(t(error.message))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const displayedUser = previewUrl ? { ...user, profileImageUpdatedAt: null } : user
+  return (
+    <div className="profile-image-control">
+      <div className="profile-image-control-user">
+        {previewUrl ? <span className="mini-avatar has-profile-image"><img src={previewUrl} alt={t('Profile photo preview')} /></span> : <UserAvatar user={displayedUser} />}
+        <div><strong>{user?.name}</strong><small>{t('Profile photo')}</small></div>
+      </div>
+      <div className="profile-image-control-actions">
+        {file ? <>
+          <button type="button" className="ghost-button small" onClick={() => setFile(null)} disabled={busy}>{t('Cancel')}</button>
+          <button type="button" className="primary-button small" onClick={saveImage} disabled={busy}>{busy ? t('Saving…') : t('Save photo')}</button>
+        </> : <>
+          <label className="ghost-button small profile-photo-trigger" onClick={() => { if (inputRef.current) { inputRef.current.value = ''; setFile(null); setError('') } }}>
+  {user?.profileImageUpdatedAt ? t('Change photo') : t('Add photo')}
+  <input ref={inputRef} type="file" accept="image/png,image/jpeg,image/webp" onChange={selectImage} className="sr-only" aria-label={t('Choose profile photo')} />
+</label>
+          {user?.profileImageUpdatedAt && <button type="button" className="text-action danger-action" onClick={removeImage} disabled={busy}>{busy ? t('Removing…') : t('Remove')}</button>}
+        </>}
+      </div>
+    </div>
+  )
+}
 
 const emptyDashboard = {
   metrics: { todaySales: 0, todayExpenses: 0, revenue: 0, profit: 0, expenses: 0, netProfit: 0, cashFlow: 0, productsSold: 0, lowStock: 0, productCount: 0 },
@@ -183,6 +309,7 @@ async function apiRequest(path, options = {}) {
   const response = await fetch(`/api${path}`, {
     ...options,
     credentials: 'same-origin',
+    cache: 'no-store',
     headers: {
       ...(options.body ? { 'Content-Type': 'application/json' } : {}),
       ...options.headers,
@@ -201,9 +328,16 @@ function productForPos(product) {
   return {
     id: product.id,
     label: product.name,
+    sku: product.sku,
+    barcode: product.barcode,
+    description: product.description,
+    categoryId: product.categoryId,
     price: product.sellingPrice,
     buyingPrice: product.buyingPrice,
     stock: product.stock,
+    reorderLevel: product.reorderLevel,
+    imageUrl: product.imageUrl,
+    imageUpdatedAt: product.imageUpdatedAt,
     tone: 'blue',
   }
 }
@@ -214,6 +348,7 @@ function PerformanceGraph({ chart, currencyCode, language = 'en' }) {
   const padding = { top: 24, right: 24, bottom: 48, left: 88 }
   const plotRef = useRef(null)
   const [activeIndex, setActiveIndex] = useState(null)
+  const [hiddenSeries, setHiddenSeries] = useState([])
   const plotWidth = width - padding.left - padding.right
   const plotHeight = height - padding.top - padding.bottom
   const values = chart.flatMap((point) => [point.revenue, point.expenses, point.netProfit])
@@ -242,9 +377,9 @@ function PerformanceGraph({ chart, currencyCode, language = 'en' }) {
     }, '')
   }
   const series = [
-    { key: 'revenue', label: translate('Revenue', language), color: '#2563eb' },
+    { key: 'revenue', label: translate('Revenue', language), color: '#35cbbb' },
     { key: 'expenses', label: translate('Expenses', language), color: '#f59e0b' },
-    { key: 'netProfit', label: translate('Net Profit', language), color: '#16a34a' },
+    { key: 'netProfit', label: translate('Net Profit', language), color: '#9b83ff' },
   ]
   const labelIndexes = [...new Set([0, Math.floor((chart.length - 1) / 4), Math.floor((chart.length - 1) / 2), Math.floor(((chart.length - 1) * 3) / 4), chart.length - 1])]
     .filter((index) => index >= 0)
@@ -259,9 +394,19 @@ function PerformanceGraph({ chart, currencyCode, language = 'en' }) {
   const activeX = activeIndex === null ? null : x(activeIndex)
 
   return (
-    <div className="performance-chart">
+    chart.length === 0 ? <p className="dashboard-chart-empty" role="status">{translate('No financial activity is available for this period.', language)}</p> : <div className="performance-chart">
       <div className="performance-legend" aria-label="Graph series">
-        {series.map((item) => <span key={item.key}><i style={{ backgroundColor: item.color }} />{item.label}</span>)}
+        {series.map((item) => (
+          <button
+            type="button"
+            key={item.key}
+            aria-pressed={!hiddenSeries.includes(item.key)}
+            className={hiddenSeries.includes(item.key) ? 'series-toggle is-hidden' : 'series-toggle'}
+            onClick={() => setHiddenSeries((current) => current.includes(item.key)
+              ? current.filter((key) => key !== item.key)
+              : [...current, item.key])}
+          ><i style={{ backgroundColor: item.color }} />{item.label}</button>
+        ))}
       </div>
       <div className="performance-plot" ref={plotRef}>
         <svg
@@ -286,6 +431,7 @@ function PerformanceGraph({ chart, currencyCode, language = 'en' }) {
             )
           })}
           {series.map((item) => {
+            if (hiddenSeries.includes(item.key)) return null
             const path = smoothPath(chart.map((point) => point[item.key]))
             return (
               <g key={item.key}>
@@ -314,8 +460,8 @@ function PerformanceGraph({ chart, currencyCode, language = 'en' }) {
           <div
             className="chart-tooltip"
             style={{
-              left: activeX < width / 2 ? '0' : '100%',
-              transform: activeX < width / 2 ? 'none' : 'translateX(-100%)',
+              left: `${activeX / width * 100}%`,
+              transform: activeX / width < 0.2 ? 'none' : activeX / width > 0.8 ? 'translateX(-100%)' : 'translateX(-50%)',
             }}
           >
             <strong>{new Date(`${activePoint.date}T00:00:00`).toLocaleDateString(language === 'sw' ? 'sw-TZ' : 'en-TZ', { day: 'numeric', month: 'short', year: 'numeric' })}</strong>
@@ -468,6 +614,7 @@ function ToastViewport({ toasts, onDismiss, language }) {
 }
 
 function App() {
+  const reduceMotion = useReducedMotion()
   useEffect(() => {
     const scrollTimers = new Map()
     const showScrollbar = (event) => {
@@ -499,6 +646,8 @@ function App() {
   const [sessionUser, setSessionUser] = useState(null)
   const [theme, setTheme] = useState('dark')
   const [language, setLanguage] = useState('en')
+  const [adminChangePasswordOpen, setAdminChangePasswordOpen] = useState(false)
+
   const [authMode, setAuthMode] = useState('login')
   const [loginError, setLoginError] = useState('')
   const [setupRequired, setSetupRequired] = useState(false)
@@ -507,18 +656,30 @@ function App() {
   const [platformApplications, setPlatformApplications] = useState([])
   const [platformSubscriptionSettings, setPlatformSubscriptionSettings] = useState({ monthlyFee: 0, currency: 'TZS', graceDays: 0 })
   const [googleClientId, setGoogleClientId] = useState(null)
+  const [productImageMaxBytes, setProductImageMaxBytes] = useState(maxImageBytes)
+  const [productImageBusy, setProductImageBusy] = useState(false)
   const [googleCredential, setGoogleCredential] = useState('')
   const [registrationProfile, setRegistrationProfile] = useState({ ownerName: '', email: '' })
   const googleButtonRef = useRef(null)
   const [selectedNav, setSelectedNav] = useState('Overview')
   const [expandedNavGroup, setExpandedNavGroup] = useState('Dashboard')
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [modal, setModal] = useState('')
   const [toasts, setToasts] = useState([])
   const toastIdRef = useRef(0)
   const notifiedSaleReceiptsRef = useRef(new Set())
   const [products, setProducts] = useState([])
+  const [productsLoaded, setProductsLoaded] = useState(false)
+  const [productCategories, setProductCategories] = useState([])
+  const [productCategoryFilter, setProductCategoryFilter] = useState('')
   const [cart, setCart] = useState([])
+  const [cartDrawerOpen, setCartDrawerOpen] = useState(false)
+  const [saleCustomer, setSaleCustomer] = useState('')
+  const [salePaymentMethod, setSalePaymentMethod] = useState('cash')
+  const [saleSubmitting, setSaleSubmitting] = useState(false)
+  const saleInProgressRef = useRef(false)
+  const workspaceRefreshSequenceRef = useRef(0)
   const [transactions, setTransactions] = useState([])
   const [expenses, setExpenses] = useState([])
   const [dashboard, setDashboard] = useState(emptyDashboard)
@@ -533,7 +694,9 @@ function App() {
   const [conversionLoading, setConversionLoading] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
   const [logoUploading, setLogoUploading] = useState(false)
-  const [chartRange, setChartRange] = useState('30days')
+  const [pendingBusinessLogo, setPendingBusinessLogo] = useState(null)
+  const pendingBusinessLogoPreview = useMemo(() => pendingBusinessLogo ? URL.createObjectURL(pendingBusinessLogo) : '', [pendingBusinessLogo])
+  const [chartRange, setChartRange] = useState('month')
   const [chartDate, setChartDate] = useState(todayDate)
   const [customChartStart, setCustomChartStart] = useState(customRangeDefaultStart)
   const [customChartEnd, setCustomChartEnd] = useState(todayDate)
@@ -541,14 +704,28 @@ function App() {
   const [dashboardSearch, setDashboardSearch] = useState('')
   const [transactionCategoryFilter, setTransactionCategoryFilter] = useState('')
   const [transactionSortDirection, setTransactionSortDirection] = useState('desc')
+  const [transactionPage, setTransactionPage] = useState(1)
+  const [chartLoading, setChartLoading] = useState(false)
+  const [chartError, setChartError] = useState('')
+  const [monthlyReportOpen, setMonthlyReportOpen] = useState(false)
+  const [reportMonth, setReportMonth] = useState(new Date().getMonth() + 1)
+  const [reportYear, setReportYear] = useState(new Date().getFullYear())
+  const [reportData, setReportData] = useState(null)
+  const [reportLoading, setReportLoading] = useState(false)
+  const [reportError, setReportError] = useState('')
+  const [reportType, setReportType] = useState('monthly')
+  const [reportCustomStart, setReportCustomStart] = useState(customRangeDefaultStart)
+  const [reportCustomEnd, setReportCustomEnd] = useState(todayDate)
   const [salesDate, setSalesDate] = useState(todayDate)
   const salesDateRef = useRef(todayDate)
   const [showAllSales, setShowAllSales] = useState(false)
-  const [drawerOpen, setDrawerOpen] = useState(false)
+  const [posProductSearch, setPosProductSearch] = useState('')
+  const [posProductQuery, setPosProductQuery] = useState('')
   const [agents, setAgents] = useState([])
   const [agentToDelete, setAgentToDelete] = useState(null)
   const [agentToReset, setAgentToReset] = useState(null)
   const [productToRestock, setProductToRestock] = useState(null)
+  const [productToEditImage, setProductToEditImage] = useState(null)
   const [customers, setCustomers] = useState([])
   const [debtsReport, setDebtsReport] = useState(null)
   const [selectedCustomer, setSelectedCustomer] = useState(null)
@@ -563,6 +740,10 @@ function App() {
   const [deleteCustomerDialog, setDeleteCustomerDialog] = useState(null)
   const [debtActionBusy, setDebtActionBusy] = useState(false)
   const posProducts = products.map(productForPos)
+  const visiblePosProducts = posProducts.filter((product) => {
+    const matchesSearch = `${product.label} ${product.sku || ''}`.toLowerCase().includes(posProductQuery.trim().toLowerCase())
+    return matchesSearch && (!productCategoryFilter || product.categoryId === productCategoryFilter)
+  })
   const selectedView = navigationViews[selectedNav] || 'overview'
   const t = (text) => translate(text, language)
   const dismissToast = useCallback((toastId) => {
@@ -573,6 +754,10 @@ function App() {
     .filter((item) => !transactionCategoryFilter || item.category === transactionCategoryFilter)
     .filter((item) => `${item.id} ${item.description} ${item.category} ${item.status}`.toLowerCase().includes(dashboardSearch.toLowerCase()))
     .sort((left, right) => (new Date(right.date).getTime() - new Date(left.date).getTime()) * (transactionSortDirection === 'desc' ? 1 : -1))
+  const transactionPageSize = 10
+  const transactionPageCount = Math.max(1, Math.ceil(visibleDashboardTransactions.length / transactionPageSize))
+  const pagedDashboardTransactions = visibleDashboardTransactions.slice((transactionPage - 1) * transactionPageSize, transactionPage * transactionPageSize)
+
 
   function pushToast(toast) {
     const id = ++toastIdRef.current
@@ -613,6 +798,10 @@ function App() {
     customChartRangeRef.current = { start: customChartStart, end: customChartEnd }
   }, [customChartStart, customChartEnd])
 
+  useEffect(() => () => {
+    if (pendingBusinessLogoPreview) URL.revokeObjectURL(pendingBusinessLogoPreview)
+  }, [pendingBusinessLogoPreview])
+
   function dashboardPath(range, date) {
     const params = new URLSearchParams({ range, date })
     if (range === 'custom') {
@@ -647,34 +836,56 @@ function App() {
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [mobileNavigationOpen])
 
+  useEffect(() => {
+    if (!cartDrawerOpen) return undefined
+    function closeCartOnEscape(event) {
+      if (event.key === 'Escape') setCartDrawerOpen(false)
+    }
+    window.addEventListener('keydown', closeCartOnEscape)
+    return () => window.removeEventListener('keydown', closeCartOnEscape)
+  }, [cartDrawerOpen])
+
   const cartTotal = useMemo(
     () => cart.reduce((total, item) => total + item.price * item.qty, 0),
     [cart],
   )
   const refreshWorkspace = useCallback(async (user, rangeName = '30days', date = todayDate) => {
     if (!user) return
+    const refreshSequence = ++workspaceRefreshSequenceRef.current
     if (user.role === 'platform_admin') {
       const [businessResult, applicationResult, settingsResult] = await Promise.all([
         apiRequest('/platform/businesses'),
         apiRequest('/platform/applications'),
         apiRequest('/platform/subscription-settings'),
       ])
+      if (refreshSequence !== workspaceRefreshSequenceRef.current) return false
       setPlatformBusinesses(businessResult.businesses)
       setPlatformApplications(applicationResult.applications)
       setPlatformSubscriptionSettings(settingsResult.settings)
-      return
+      return true
     }
     const salesPath = user.role === 'business_admin' && salesDateRef.current
       ? `/sales?date=${encodeURIComponent(salesDateRef.current)}`
       : '/sales'
-    const [productResult, saleResult, customerResult, debtReportResult, businessResult] = await Promise.all([
+    const [productResult, saleResult, customerResult, debtReportResult, businessResult, productCategoryResult] = await Promise.all([
       apiRequest('/products'),
       apiRequest(salesPath),
       apiRequest('/customers'),
       apiRequest('/customers/report'),
       apiRequest('/business'),
+      apiRequest('/categories'),
     ])
+    if (refreshSequence !== workspaceRefreshSequenceRef.current) return false
     setProducts(productResult.products)
+    setProductsLoaded(true)
+    if (user.role === 'business_admin' || user.role === 'sales_agent') {
+      const refreshedProducts = new Map(productResult.products.map((product) => [product.id, product]))
+      setCart((items) => items.map((item) => {
+        const current = refreshedProducts.get(item.id)
+        return { ...item, stock: current?.stock ?? 0, imageUpdatedAt: current?.imageUpdatedAt ?? null, imageUrl: current?.imageUrl ?? null }
+      }))
+    }
+    setProductCategories(productCategoryResult.categories)
     setTransactions(saleResult.sales)
     setCustomers(customerResult.customers)
     setDebtsReport(debtReportResult)
@@ -687,11 +898,31 @@ function App() {
         apiRequest('/staff'),
         apiRequest('/expenses'),
       ])
+      if (refreshSequence !== workspaceRefreshSequenceRef.current) return false
       setDashboard(dashboardResult)
       setAgents(staffResult.agents)
       setExpenses(expenseResult.expenses)
     }
+    return true
   }, [])
+
+  useEffect(() => {
+    if (sessionUser?.role !== 'platform_admin') return undefined
+    const refreshNow = () => {
+      refreshWorkspace(sessionUser).catch(() => {})
+    }
+    const interval = window.setInterval(refreshNow, 5000)
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') refreshNow()
+    }
+    document.addEventListener('visibilitychange', handleVisibility)
+    window.addEventListener('focus', refreshNow)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', handleVisibility)
+      window.removeEventListener('focus', refreshNow)
+    }
+  }, [sessionUser, refreshWorkspace])
 
   useEffect(() => {
     if (sessionUser?.role !== 'business_admin' || !business?.currency) return undefined
@@ -724,7 +955,7 @@ function App() {
   }, [sessionUser, business?.currency])
 
   useEffect(() => {
-    document.title = 'KAJUNA BMS | Business Management System'
+    document.title = 'Business Management System'
     let mounted = true
     apiRequest('/setup')
       .then(({ setupRequired: required, platformOwnerSetupAvailable: ownerAvailable }) => {
@@ -753,22 +984,29 @@ function App() {
 
   useEffect(() => {
     apiRequest('/config')
-      .then(({ googleClientId: clientId }) => setGoogleClientId(clientId))
+      .then(({ googleClientId: clientId, maxProductImageBytes: maxBytes }) => {
+        setGoogleClientId(clientId)
+        if (Number.isSafeInteger(maxBytes) && maxBytes > 0) setProductImageMaxBytes(maxBytes)
+      })
       .catch((error) => setLoginError(`Could not load sign-in options: ${error.message}`))
   }, [])
 
   useEffect(() => {
-    if (sessionUser?.role !== 'business_admin') return undefined
+    if (!['business_admin', 'sales_agent'].includes(sessionUser?.role)) return undefined
     const syncBusinessActivity = () => {
       if (document.visibilityState === 'visible') {
+        const isBusinessAdmin = sessionUser.role === 'business_admin'
         const range = { Today: 'today', 'This Week': 'week', 'This Month': 'month', '3 Months': '3months', '1 Year': 'year', day: 'day' }[chartRange] || chartRange
         Promise.all([
-          apiRequest(dashboardPath(range, chartDate)),
+          isBusinessAdmin ? apiRequest(dashboardPath(range, chartDate)) : Promise.resolve(null),
           apiRequest(salesDateRef.current ? `/sales?date=${encodeURIComponent(salesDateRef.current)}` : '/sales'),
+          apiRequest('/business'),
         ])
-          .then(([dashboardResult, salesResult]) => {
-            setDashboard(dashboardResult)
+          .then(([dashboardResult, salesResult, businessResult]) => {
+            if (dashboardResult) setDashboard(dashboardResult)
             setTransactions(salesResult.sales)
+            setBusiness(businessResult.business)
+            setDisplayCurrency(businessResult.business.currency)
           })
           .catch((error) => setNotice(error.message))
       }
@@ -873,6 +1111,8 @@ function App() {
     const apiRange = { Today: 'today', 'This Week': 'week', 'This Month': 'month', '3 Months': '3months', '1 Year': 'year', day: 'day' }[range] || range
     setChartRange(range)
     setChartDate(date)
+    setChartLoading(true)
+    setChartError('')
     try {
       const params = new URLSearchParams({ range: apiRange, date })
       if (apiRange === 'custom') {
@@ -883,7 +1123,29 @@ function App() {
       const result = await apiRequest(`/dashboard?${params.toString()}`)
       setDashboard(result)
     } catch (error) {
+      setChartError(error.message)
       setNotice(error.message)
+    } finally {
+      setChartLoading(false)
+  async function loadMonthlyReport() {
+    setReportLoading(true)
+    setReportError('')
+    try {
+      let url = `/reports/monthly?month=${reportMonth}&year=${reportYear}`
+      if (reportType === 'custom') {
+        url = `/reports/custom?startDate=${reportCustomStart}&endDate=${reportCustomEnd}`
+      }
+      const result = await apiRequest(url)
+      setReportData(result)
+    } catch (error) {
+      setReportError(error.message)
+      setNotice(error.message)
+    } finally {
+      setReportLoading(false)
+    }
+  }
+
+
     }
   }
 
@@ -895,6 +1157,18 @@ function App() {
     if (item === 'Add Product') setModal('product')
     if (item === 'Add Expense') setModal('expense')
     if (item === 'Add Customer') setDebtCustomerDialog({ mode: 'create', customer: null })
+    if (item === 'Monthly Financial Reports' || item === 'Generated Reports') {
+      setReportType('monthly')
+      setMonthlyReportOpen(true)
+      setReportData(null)
+      setReportError('')
+    }
+    if (item === 'Custom Date-Range Reports') {
+      setReportType('custom')
+      setMonthlyReportOpen(true)
+      setReportData(null)
+      setReportError('')
+    }
   }
 
   async function loadCustomers(search = '', status = '') {
@@ -1095,6 +1369,7 @@ function App() {
   }
 
   function addToCart(product) {
+    if (saleInProgressRef.current) return
     const existing = cart.find((item) => item.id === product.id)
     if ((!existing && product.stock < 1) || (existing && existing.qty >= product.stock)) {
       setNotice(`${product.label} is out of stock.`)
@@ -1104,31 +1379,67 @@ function App() {
       if (existing) {
         return items.map((item) => item.id === product.id ? { ...item, qty: item.qty + 1 } : item)
       }
-      return [...items, { id: product.id, name: product.label, price: product.price, buyingPrice: product.buyingPrice, stock: product.stock, qty: 1 }]
+      return [...items, { id: product.id, name: product.label, price: product.price, buyingPrice: product.buyingPrice, stock: product.stock, imageUpdatedAt: product.imageUpdatedAt, imageUrl: product.imageUrl, qty: 1 }]
     })
     setNotice(`${product.label} added to the sale.`)
   }
 
-  function changeQuantity(name, change) {
+  function changeQuantity(identifier, change) {
+    if (saleInProgressRef.current) return
     setCart((items) => items
-      .map((item) => item.name === name ? { ...item, qty: Math.min(item.stock, item.qty + change) } : item)
+      .map((item) => item.id === identifier || item.name === identifier ? { ...item, qty: Math.min(item.stock, item.qty + change) } : item)
       .filter((item) => item.qty > 0))
   }
 
-  async function completeSale(customer = 'Walk-in customer') {
+  function clearCart() {
+    if (saleInProgressRef.current) return
+    if (cart.length && window.confirm(translate('Clear all items from the shopping cart?', language))) {
+      setCart([])
+    }
+  }
+
+  async function completeSale(customer = 'Walk-in customer', paymentMethod = 'cash') {
+    if (saleInProgressRef.current) return false
     if (cart.length === 0) {
       setNotice('Add a product to the cart before completing a sale.')
-      return
+      return false
     }
+    saleInProgressRef.current = true
+    setSaleSubmitting(true)
     try {
+      const { products: latestProducts } = await apiRequest('/products')
+      setProducts(latestProducts)
+      const latestById = new Map(latestProducts.map((product) => [product.id, product]))
+      const unavailable = cart.some((item) => !latestById.has(item.id))
+      const overstocked = cart.some((item) => (latestById.get(item.id)?.stock ?? 0) < item.qty)
+      const repriced = cart.some((item) => {
+        const current = latestById.get(item.id)
+        return current && Math.abs(current.sellingPrice - item.price) > 0.005
+      })
+      setCart((items) => items.map((item) => {
+        const current = latestById.get(item.id)
+        return current ? { ...item, name: current.name, price: current.sellingPrice, buyingPrice: current.buyingPrice, stock: current.stock, imageUpdatedAt: current.imageUpdatedAt } : { ...item, stock: 0 }
+      }))
+      if (unavailable || overstocked || repriced) {
+        setNotice(unavailable ? 'A product in the cart is no longer available. Remove it to continue.'
+          : overstocked ? 'Available stock changed. Adjust the quantities and try again.'
+            : 'Product prices changed. Review the updated cart and confirm the sale again.')
+        return false
+      }
+      const summary = cart.map((item) => item.qty + ' x ' + item.name + ' - ' + formatCurrency(item.price * item.qty, displayCurrency)).join('\n')
+        + '\n\n' + translate('Total payable', language) + ': ' + formatCurrency(cartTotal, displayCurrency)
+      if (!window.confirm(translate('Confirm sale?', language) + '\n\n' + summary)) return false
       const { sale, ratesStale } = await apiRequest('/sales', {
         method: 'POST',
         body: JSON.stringify({
           customer,
+          paymentMethod,
           items: cart.map((item) => ({ productId: item.id, quantity: item.qty })),
         }),
       })
       setCart([])
+      setSaleCustomer('')
+      setCartDrawerOpen(false)
       const receipt = sale.id
       if (!notifiedSaleReceiptsRef.current.has(receipt)) {
         notifiedSaleReceiptsRef.current.add(receipt)
@@ -1136,18 +1447,21 @@ function App() {
           const oldestReceipt = notifiedSaleReceiptsRef.current.values().next().value
           notifiedSaleReceiptsRef.current.delete(oldestReceipt)
         }
-        pushToast({
-          type: 'success',
-          title: 'Sale completed successfully',
-          amount: sale.tshAmount,
-          receipt,
-          duration: 5000,
-        })
+        pushToast({ type: 'success', title: 'Sale completed successfully', amount: sale.tshAmount, receipt, duration: 5000 })
       }
-      await refreshWorkspace(sessionUser, chartRange, chartDate)
+      try {
+        await refreshWorkspace(sessionUser, chartRange, chartDate)
+      } catch (refreshError) {
+        setNotice('Sale completed, but the workspace could not refresh: ' + refreshError.message)
+      }
       if (ratesStale) setNotice('Sale completed using an outdated exchange-rate snapshot.')
+      return true
     } catch (error) {
       setNotice(error.message)
+      return false
+    } finally {
+      saleInProgressRef.current = false
+      setSaleSubmitting(false)
     }
   }
 
@@ -1160,7 +1474,7 @@ function App() {
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }))
     const link = document.createElement('a')
     link.href = url
-    link.download = 'kajuna-bms-sales.csv'
+    link.download = 'bms-sales.csv'
     link.click()
     URL.revokeObjectURL(url)
     setNotice('Sales report exported as CSV.')
@@ -1176,16 +1490,105 @@ function App() {
       sellingPrice: Number(formData.get('sellingPrice')),
       quantity: Number(formData.get('stock')),
     }
+    const imageError = String(formData.get('productImageError') || '')
+    if (imageError) { setNotice(imageError); return }
+    const selectedImage = formData.get('productImage')
+    const imageFile = selectedImage instanceof File && selectedImage.size ? selectedImage : null
     if (!payload.name || !Number.isFinite(payload.buyingPrice) || payload.buyingPrice < 0 || !Number.isFinite(payload.sellingPrice) || payload.sellingPrice <= payload.buyingPrice || !Number.isInteger(payload.quantity) || payload.quantity < 0) {
       setNotice('Enter a product name, a valid buying price, a selling price above the buying price, and a valid stock quantity.')
       return
     }
-    await performAction(async () => {
+    if (imageFile && !supportedImageMimeTypes.includes(imageFile.type)) {
+      setNotice('Choose a JPG, PNG, or WebP product image.')
+      return
+    }
+    if (imageFile && imageFile.size > productImageMaxBytes) {
+      setNotice('The product image exceeds the configured file size limit.')
+      return
+    }
+    setProductImageBusy(true)
+    try {
       const productPayload = { ...payload }
       if (!productPayload.sku) delete productPayload.sku
-      await apiRequest('/products', { method: 'POST', body: JSON.stringify(productPayload) })
+      const result = await apiRequest('/products', { method: 'POST', body: JSON.stringify(productPayload) })
+      const createdProduct = result.product
+      if (imageFile) {
+        try {
+          await apiRequest('/products/' + createdProduct.id + '/image', {
+            method: 'PUT',
+            body: imageFile,
+            headers: { 'Content-Type': imageFile.type },
+          })
+        } catch (imageError) {
+          setModal('')
+          try { await refreshWorkspace(sessionUser, chartRange, chartDate) } catch { /* Keep the upload failure visible. */ }
+          setNotice('Product created, but its image could not be saved: ' + imageError.message + ' You can add it later from Product stock.')
+          return
+        }
+      }
       setModal('')
-    }, `${payload.name} added to products.`)
+      try {
+        await refreshWorkspace(sessionUser, chartRange, chartDate)
+      } catch (refreshError) {
+        setNotice('Product saved, but the product list could not refresh: ' + refreshError.message)
+        return
+      }
+      setNotice(payload.name + ' added to products.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setProductImageBusy(false)
+    }
+  }
+
+  async function saveProductImage(event) {
+    event.preventDefault()
+    if (!productToEditImage) return
+    const formData = new FormData(event.currentTarget)
+    const imageError = String(formData.get('productImageError') || '')
+    if (imageError) { setNotice(imageError); return }
+    const selectedImage = formData.get('productImage')
+    const imageFile = selectedImage instanceof File && selectedImage.size ? selectedImage : null
+    const removeImage = formData.get('removeProductImage') === 'true'
+    if (!imageFile && !removeImage) {
+      setNotice('Choose a new product image or select Remove Image before saving.')
+      return
+    }
+    if (imageFile && !supportedImageMimeTypes.includes(imageFile.type)) {
+      setNotice('Choose a JPG, PNG, or WebP product image.')
+      return
+    }
+    if (imageFile && imageFile.size > productImageMaxBytes) {
+      setNotice('The product image exceeds the configured file size limit.')
+      return
+    }
+    if (removeImage && !imageFile && !window.confirm('Remove this product image? The product itself will remain unchanged.')) return
+    setProductImageBusy(true)
+    try {
+      if (imageFile) {
+        await apiRequest('/products/' + productToEditImage.id + '/image', {
+          method: 'PUT',
+          body: imageFile,
+          headers: { 'Content-Type': imageFile.type },
+        })
+      } else {
+        await apiRequest('/products/' + productToEditImage.id + '/image', { method: 'DELETE' })
+      }
+      const productName = productToEditImage.name
+      setModal('')
+      setProductToEditImage(null)
+      try {
+        await refreshWorkspace(sessionUser, chartRange, chartDate)
+      } catch (refreshError) {
+        setNotice('Product image was saved, but the product list could not refresh: ' + refreshError.message)
+        return
+      }
+      setNotice(imageFile ? productName + ' image updated.' : productName + ' image removed.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setProductImageBusy(false)
+    }
   }
 
   async function restockProduct(event) {
@@ -1342,7 +1745,6 @@ function App() {
       return
     }
     setLoginError('')
-    delete payload.confirmPassword
     if (googleCredential) payload.googleCredential = googleCredential
     try {
       const result = await apiRequest('/auth/register-business', { method: 'POST', body: JSON.stringify(payload) })
@@ -1411,7 +1813,7 @@ function App() {
     }
   }
 
-  async function uploadBusinessLogo(event) {
+  function selectBusinessLogo(event) {
     const input = event.currentTarget
     const file = input.files?.[0]
     if (!file) return
@@ -1424,14 +1826,20 @@ function App() {
       setNotice('Business logos must be no larger than 5 MB.')
       return
     }
+    setPendingBusinessLogo(file)
+  }
+
+  async function saveBusinessLogo() {
+    if (!pendingBusinessLogo) return
     setLogoUploading(true)
     try {
       const result = await apiRequest('/business/logo', {
         method: 'PUT',
-        body: file,
-        headers: { 'Content-Type': file.type },
+        body: pendingBusinessLogo,
+        headers: { 'Content-Type': pendingBusinessLogo.type },
       })
       setBusiness((current) => current ? { ...current, logoUpdatedAt: result.logoUpdatedAt } : current)
+      setPendingBusinessLogo(null)
       setNotice('Business logo updated. It is now visible to business admins and sales agents.')
     } catch (error) {
       setNotice(error.message)
@@ -1441,12 +1849,16 @@ function App() {
   }
 
   async function removeBusinessLogo() {
+    setLogoUploading(true)
     try {
       await apiRequest('/business/logo', { method: 'DELETE' })
       setBusiness((current) => current ? { ...current, logoUpdatedAt: null } : current)
+      setPendingBusinessLogo(null)
       setNotice('Business logo removed.')
     } catch (error) {
       setNotice(error.message)
+    } finally {
+      setLogoUploading(false)
     }
   }
 
@@ -1516,8 +1928,15 @@ function App() {
       setLanguage('en')
       setSessionUser(null)
       setCart([])
+      setCartDrawerOpen(false)
+      setSaleCustomer('')
+      setSalePaymentMethod('cash')
+      setProductCategoryFilter('')
+      setPosProductSearch('')
+      setPosProductQuery('')
       setTransactions([])
       setProducts([])
+      setProductsLoaded(false)
       setAgents([])
       setPlatformBusinesses([])
       setDashboard(emptyDashboard)
@@ -1534,15 +1953,15 @@ function App() {
     return (
       <div className="login-page">
         <ToastViewport toasts={toasts} onDismiss={dismissToast} language={language} />
-        <div className="mobile-auth-brand" aria-label="KAJUNA BMS">
+        <div className="mobile-auth-brand" aria-label="Business Management Portal">
           <span className="mobile-auth-mark" aria-hidden="true">
             <svg viewBox="0 0 32 32" fill="none">
-              <path d="M16 2.8 28 9.5v13L16 29.2 4 22.5v-13L16 2.8Z" fill="url(#kajuna-mark-fill)" />
-              <path d="m16 2.8 0 13.3m12-6.6-12 6.6-12-6.6m12 6.6v13.1m0-13.1 11.7 6.4M16 16.1 4.3 22.5" stroke="#D9F8FF" strokeWidth="1.15" />
-              <defs><linearGradient id="kajuna-mark-fill" x1="5" y1="5" x2="27" y2="27" gradientUnits="userSpaceOnUse"><stop stopColor="#25D9FF" /><stop offset=".55" stopColor="#1975FF" /><stop offset="1" stopColor="#713BFF" /></linearGradient></defs>
+              <rect x="4" y="4" width="24" height="24" rx="7" fill="url(#portal-mark-fill)" />
+              <path d="M10 16.5 14.5 21 22 12.5" stroke="#FFFFFF" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+              <defs><linearGradient id="portal-mark-fill" x1="4" y1="4" x2="28" y2="28" gradientUnits="userSpaceOnUse"><stop stopColor="#25D9FF" /><stop offset=".55" stopColor="#1975FF" /><stop offset="1" stopColor="#713BFF" /></linearGradient></defs>
             </svg>
           </span>
-          <span><strong>KAJUNA BMS</strong><small>Manage · Track · Grow</small></span>
+          <span><strong>Business Management Portal</strong><small>Secure access for your business</small></span>
         </div>
         <div className={`login-shell${isAuthenticatingOwner ? ' register-mode' : ''}${isRegistering ? ' mobile-register-mode' : ''}${isOwnerSetup ? ' mobile-owner-mode' : ''}${!isAuthenticatingOwner ? ' mobile-login-mode' : ''}`}>
           <div className="login-panel brand-panel">
@@ -1578,7 +1997,7 @@ function App() {
                   ? 'Register your business'
                   : <><span className="desktop-auth-heading">Login</span><span className="mobile-auth-welcome-heading">Welcome back</span></>}
             </h2>
-            {!isRegistering && !isOwnerSetup && <p className="mobile-auth-description">Sign in to your KAJUNA BMS account.</p>}
+            {!isRegistering && !isOwnerSetup && <p className="mobile-auth-description">Sign in to your business account.</p>}
             {isRegistering && <p className="form-copy"><span className="desktop-auth-copy">Create a business account to get started. Your registration is reviewed by the system administrator before you can sign in. Scroll within this form to complete all details.</span><span className="mobile-auth-form-copy">Create a business account to get started. Your registration is reviewed by the system administrator before you can sign in.</span></p>}
             {isOwnerSetup && <p className="form-copy"><span className="desktop-auth-copy">Create the private owner account used to manage business access and subscriptions. Scroll within this form to complete setup.</span><span className="mobile-auth-form-copy">Create the private owner account used to manage business access and subscriptions.</span></p>}
             {loginError && <div className="login-error" role="alert">{loginError}</div>}
@@ -1696,6 +2115,8 @@ function App() {
           businesses={platformBusinesses}
           applications={platformApplications}
           settings={platformSubscriptionSettings}
+          onProfileImageUpdated={(profileImageUpdatedAt) => setSessionUser((current) => current ? { ...current, profileImageUpdatedAt } : current)}
+          onNotice={setNotice}
           onSignOut={signOut}
           onChangeAccess={changeBusinessAccess}
           onDeleteBusiness={deleteCustomerBusiness}
@@ -1723,11 +2144,15 @@ function App() {
           agent={sessionUser}
           business={business}
           products={posProducts}
+          onRefresh={() => refreshWorkspace(sessionUser)}
+          productsLoaded={productsLoaded}
+          productCategories={productCategories}
           debtProducts={products}
           customers={customers}
           currencyCode={displayCurrency}
           cart={cart}
           cartTotal={cartTotal}
+          saleSubmitting={saleSubmitting}
           transactions={transactions}
           expenseDialogOpen={modal === 'expense'}
           onOpenExpense={() => setModal('expense')}
@@ -1737,12 +2162,15 @@ function App() {
           onAddAgentDebt={addAgentDebt}
           onAddAgentCustomer={addAgentCustomer}
           onChangePassword={changeOwnPassword}
+          onProfileImageUpdated={(profileImageUpdatedAt) => setSessionUser((current) => current ? { ...current, profileImageUpdatedAt } : current)}
+          onNotice={setNotice}
           theme={theme}
           language={language}
           onThemeChange={(value) => savePreference('theme', value)}
           onLanguageChange={(value) => savePreference('language', value)}
           onAddProduct={addToCart}
           onChangeQuantity={changeQuantity}
+          onClearCart={clearCart}
           onCompleteSale={completeSale}
           onExit={signOut}
         />
@@ -1751,20 +2179,113 @@ function App() {
   }
 
   return (
-    <div className={`app-shell${selectedView === 'overview' ? ' financial-dashboard' : ''}`}>
-      <aside
-        id="business-navigation"
-        className={`sidebar${mobileNavigationOpen ? ' mobile-open' : ''}`}
-      >
-        <div className="business-sidebar-mobile-header">
-          <button
-            type="button"
-            className="mobile-navigation-close"
-            aria-label={t('Close navigation')}
-            onClick={() => setMobileNavigationOpen(false)}
-          >×</button>
+    <div className={`app-shell${sessionUser.role === 'business_admin' ? ' financial-dashboard' : ''}`}>
+      {adminChangePasswordOpen && (
+        <ChangePasswordDialog language={language} onCancel={() => setAdminChangePasswordOpen(false)} onSave={changeOwnPassword} />
+      )}
+      {monthlyReportOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMonthlyReportOpen(false) }}>
+          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="monthly-report-title" style={{ maxWidth: '900px', width: '95%' }}>
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">{t('Monthly Financial Report')}</p>
+                <h2 id="monthly-report-title">{t('Generate Monthly Report')}</h2>
+              </div>
+              <button type="button" className="icon-button" onClick={() => setMonthlyReportOpen(false)} aria-label={t('Close')}>×</button>
+            </div>
+            <div className="modal-form">
+              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '12px' }}>
+                {reportType === 'custom' ? (
+                  <>
+                    <label>{t('Start Date')}
+                      <input type="date" value={reportCustomStart} max={reportCustomEnd} onChange={(e) => setReportCustomStart(e.target.value)} />
+                    </label>
+                    <label>{t('End Date')}
+                      <input type="date" value={reportCustomEnd} min={reportCustomStart} onChange={(e) => setReportCustomEnd(e.target.value)} />
+                    </label>
+                  </>
+                ) : (
+                  <>
+                    <label>{t('Month')}
+                      <select value={reportMonth} onChange={(e) => setReportMonth(Number(e.target.value))}>
+                        {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                          <option key={m} value={m}>{new Date(2000, m - 1, 1).toLocaleString('en', { month: 'long' })}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>{t('Year')}
+                      <input type="number" value={reportYear} onChange={(e) => setReportYear(Number(e.target.value))} min="2000" max="2100" />
+                    </label>
+                  </>
+                )}
+                <button type="button" className="primary-button small" onClick={loadMonthlyReport} disabled={reportLoading}>{reportLoading ? t('Loading…') : t('Preview Report')}</button>
+              </div>
+              {reportError && <p className="dashboard-chart-error" role="alert">{reportError}</p>}
+              {reportData && (
+                <div id="monthly-report-print" style={{ background: '#fff', color: '#111', padding: '16px', borderRadius: '8px' }}>
+                  <h3>{reportData.business.name}</h3>
+                  <p>{t('Monthly Financial Report')} – {reportData.period.startDay} to {reportData.period.endDay}</p>
+                  <p>{t('Date generated')}: {new Date().toLocaleString()}</p>
+                  <h4>{t('Financial Summary')}</h4>
+                  <ul>
+                    <li>{t('TOTAL REVENUE')}: {formatCurrency(reportData.summary.totalRevenue, reportData.business.currency)}</li>
+                    <li>{t('TOTAL EXPENSES')}: {formatCurrency(reportData.summary.totalExpenses, reportData.business.currency)}</li>
+                    <li>{t('NET PROFIT')}: {formatCurrency(reportData.summary.netProfit, reportData.business.currency)}</li>
+                    <li>{t('CASH')}: {formatCurrency(reportData.summary.cash, reportData.business.currency)}</li>
+                  </ul>
+                  <p>{t('Sales transaction count')}: {reportData.summary.salesCount}</p>
+                  <p>{t('Total sales returns and refunds')}: {formatCurrency(reportData.summary.refundedAmount, reportData.business.currency)} ({reportData.summary.refundedCount})</p>
+                  <p>{t('Profit margin')}: {reportData.summary.profitMargin.toFixed(2)}%</p>
+                  <h4>{t('Expense breakdown by category')}</h4>
+                  <ul>
+                    {reportData.expenseBreakdown.map((e) => (
+                      <li key={e.category}>{e.category}: {formatCurrency(e.amount, reportData.business.currency)} ({e.percentage.toFixed(1)}%, {e.count} tx)</li>
+                    ))}
+                  </ul>
+                  <h4>{t('Payment methods breakdown')}</h4>
+                  <ul>
+                    {reportData.paymentMethods.map((p) => (
+                      <li key={p.method}>{p.method}: {formatCurrency(p.amount, reportData.business.currency)} ({p.count})</li>
+                    ))}
+                  </ul>
+                  <h4>{t('Comparison with previous month')}</h4>
+                  <p>{t('Previous revenue')}: {formatCurrency(reportData.comparison.previousRevenue, reportData.business.currency)}</p>
+                  <p>{t('Previous expenses')}: {formatCurrency(reportData.comparison.previousExpenses, reportData.business.currency)}</p>
+                  <p>{t('Previous net profit')}: {formatCurrency(reportData.comparison.previousNetProfit, reportData.business.currency)}</p>
+                  <h4>{t('Monthly revenue versus expenses')}</h4>
+                  <div style={{ fontSize: '12px' }}>
+                    {reportData.daily.map((d) => (
+                      <div key={d.date}>{d.date}: R {formatCurrency(d.revenue, reportData.business.currency)} / E {formatCurrency(d.expenses, reportData.business.currency)}</div>
+                    ))}
+                  </div>
+                  <p style={{ marginTop: '12px', fontSize: '12px' }}>{t('Generated by the system')}</p>
+                </div>
+              )}
+              {reportData && (
+                <div className="modal-actions">
+                  <button type="button" className="ghost-button" onClick={() => window.print()}>{t('Print')}</button>
+                  <button type="button" className="primary-button" onClick={() => window.print()}>{t('Download PDF')}</button>
+                </div>
+              )}
+            </div>
+          </section>
         </div>
-
+      )}
+      <UnifiedSidebar
+        id="business-navigation"
+        className="sidebar"
+        open={mobileNavigationOpen}
+        collapsed={sidebarCollapsed}
+        onClose={() => setMobileNavigationOpen(false)}
+        onToggleCollapsed={() => setSidebarCollapsed((value) => !value)}
+        closeLabel={t('Close navigation')}
+        collapseLabel={t('Collapse navigation')}
+        expandLabel={t('Expand navigation')}
+        signOutLabel={t('Sign out')}
+        onSignOut={signOut}
+        brand={<>{business?.logoUpdatedAt ? <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo unified-business-logo" /> : <span className="unified-brand-mark">B</span>}<span className="unified-brand-copy"><strong title={business?.name || sessionUser.businessName || 'My Business'}>{business?.name || sessionUser.businessName || 'My Business'}</strong><small>Business admin</small></span></>}
+        profile={<div className="account-controls"><ProfileImageControl user={sessionUser} language={language} onUpdated={(profileImageUpdatedAt) => setSessionUser((current) => current ? { ...current, profileImageUpdatedAt } : current)} onNotice={setNotice} /><button type="button" className="ghost-button account-password-button" onClick={() => setAdminChangePasswordOpen(true)}>{t('Change password')}</button></div>}
+      >
         <nav className="nav-groups" aria-label="Sidebar navigation">
           {navigation.map((group) => (
             <section className="nav-group" key={group.title}>
@@ -1775,7 +2296,7 @@ function App() {
                   aria-expanded={expandedNavGroup === group.title}
                   onClick={() => setExpandedNavGroup((current) => current === group.title ? '' : group.title)}
                 >
-                  <span><span className="nav-group-icon" aria-hidden="true">{navigationIcons[group.title]}</span>{t(group.title)}</span><span className="nav-chevron" aria-hidden="true">⌄</span>
+                  <span><span className="nav-group-icon" aria-hidden="true"><GroupNavIcon title={group.title} /></span>{t(group.title)}</span><span className="nav-chevron" aria-hidden="true">⌄</span>
                 </button>
               </h2>
               {expandedNavGroup === group.title && (
@@ -1783,7 +2304,7 @@ function App() {
                   {group.items.map((item) => (
                     <li key={item}>
                       <button type="button" className={selectedNav === item ? 'nav-item active' : 'nav-item'} onClick={() => openSection(item)}>
-                        <span className="nav-item-icon" aria-hidden="true">{navigationIcons[group.title]}</span>{t(item)}
+                        <span className="nav-item-icon" aria-hidden="true"><GroupNavIcon title={group.title} /></span>{t(item)}
                       </button>
                     </li>
                   ))}
@@ -1792,14 +2313,7 @@ function App() {
             </section>
           ))}
         </nav>
-        <div className="sidebar-account">
-          <div className="user-chip">
-            <span className="mini-avatar">{sessionUser.name.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span>
-            <div><strong>{sessionUser.name}</strong><small>Business admin</small></div>
-          </div>
-          <button type="button" className="sidebar-signout" onClick={signOut}>{t('Sign out')}</button>
-        </div>
-      </aside>
+      </UnifiedSidebar>
       {mobileNavigationOpen && (
         <>
           <button
@@ -1830,14 +2344,14 @@ function App() {
             <span /><span /><span />
           </button>
           <div className="business-brand">
-            {business?.logoUpdatedAt && <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo" />}
+            {business?.logoUpdatedAt ? <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo" /> : <span className="business-brand-fallback" aria-hidden="true">▧</span>}
             <div><p className="eyebrow">{t('Business admin dashboard')}</p><strong>{business?.name || sessionUser.businessName}</strong></div>
           </div>
           <div className="topbar-tools">
             {selectedView === 'overview' && (
               <label className="dashboard-header-search">
                 <span aria-hidden="true">⌕</span>
-                <input value={dashboardSearch} onChange={(event) => setDashboardSearch(event.target.value)} placeholder={t('Search transactions')} aria-label={t('Search transactions')} />
+                <input value={dashboardSearch} onChange={(event) => { setDashboardSearch(event.target.value); setTransactionPage(1) }} placeholder={t('Search transactions')} aria-label={t('Search transactions')} />
               </label>
             )}
             <PreferenceControls
@@ -1846,10 +2360,10 @@ function App() {
               onThemeChange={(value) => savePreference('theme', value)}
               onLanguageChange={(value) => savePreference('language', value)}
             />
-            <button type="button" className="dashboard-profile" aria-label={sessionUser.name}>
-              <span className="mini-avatar">{sessionUser.name.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span>
-              <span>{sessionUser.name}</span>
-            </button>
+            <details className="dashboard-profile-menu">
+              <summary className="dashboard-profile" aria-label={t('Open profile menu')}><UserAvatar user={sessionUser} /><span>{sessionUser.name}</span><span className="profile-menu-chevron" aria-hidden="true">?</span></summary>
+              <div className="dashboard-profile-popover"><strong>{sessionUser.name}</strong><small>{sessionUser.email}</small><button type="button" onClick={(event) => { openSection('Business Profile'); event.currentTarget.closest('details')?.removeAttribute('open') }}>{t('Business Profile')}</button><button type="button" onClick={signOut}>{t('Sign out')}</button></div>
+            </details>
             {selectedView === 'transactions' && <button type="button" className="ghost-button" onClick={exportTransactions}>{t('Export')}</button>}
             {selectedView === 'sales' && <button type="button" className="primary-button" onClick={() => openSection('New Sale / POS')}>{t('+ Add Sale')}</button>}
           </div>
@@ -1860,24 +2374,63 @@ function App() {
             <p className="eyebrow">{selectedView === 'overview' ? t('Financial overview') : t(selectedNav)}</p>
             <h1>{selectedView === 'overview' ? t('Dashboard') : t(selectedNav)}</h1>
           </div>
-          {selectedView === 'overview' && <div className="header-status"><span className="status-dot" />{business?.name || sessionUser.businessName}</div>}
+          {selectedView === 'overview' && (
+            <div className="header-status">
+              <span className="status-dot" />{business?.name || sessionUser.businessName}
+              <span aria-hidden="true" className="date-filter-icon">📅</span>
+              <select
+                aria-label={t('Financial overview date range')}
+                value={chartRange}
+                onChange={(event) => {
+                  const value = event.target.value
+                  if (value === 'custom') loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)
+                  else loadDashboardChart(value, todayDate)
+                }}
+                disabled={chartLoading}
+                className="header-date-filter"
+              >
+                <option value="today">{t('Today')}</option>
+                <option value="yesterday">{t('Yesterday')}</option>
+                <option value="thisWeek">{t('This Week')}</option>
+                <option value="lastWeek">{t('Last Week')}</option>
+                <option value="month">{t('This Month')}</option>
+                <option value="lastMonth">{t('Last Month')}</option>
+                <option value="thisQuarter">{t('This Quarter')}</option>
+                <option value="thisYear">{t('This Year')}</option>
+                <option value="custom">{t('Custom Date Range')}</option>
+              </select>
+            </div>
+          )}
         </section>
         {dashboard.fxWarnings?.map((warning) => <p className="fx-warning" role="status" key={warning}>{t(warning)}</p>)}
 
         {selectedView === 'overview' && <section className="stats-grid financial-kpi-grid">
-          {metricCards.map((card) => (
-            <article className={`stat-card financial-kpi-card ${card.tone}`} key={card.label}>
-              <div className="kpi-card-heading">
-                <span>{t(card.label)}</span>
-                <i aria-hidden="true">{card.icon}</i>
-              </div>
-              <h3>{formatCurrency(dashboard.metrics[card.key] || 0, displayCurrency)}</h3>
-              <div className="kpi-card-foot">
-                <span className="kpi-indicator" />
-                <span>{t(card.key === 'netProfit' ? 'Gross profit less expenses' : card.key === 'cashFlow' ? 'Collections less expenses' : 'Month to date')}</span>
-              </div>
-            </article>
+          {metricCards.map((card, index) => (
+            (() => {
+              const currentValue = Number(dashboard.metrics[card.key]) || 0
+              const previousValue = Number(dashboard.previousPeriod?.[card.key])
+              const comparison = getMetricComparison(currentValue, previousValue, card.key, language)
+              return <motion.article className={`stat-card financial-kpi-card ${card.key === 'netProfit' ? (currentValue >= 0 ? 'green' : 'red') : card.tone}`} key={card.label} initial={reduceMotion ? false : { opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: reduceMotion ? 0 : 0.32, delay: reduceMotion ? 0 : index * 0.055 }}>
+                <div className="kpi-card-heading">
+                  <span>{t(card.label)}</span>
+                  <i aria-hidden="true">{card.icon}</i>
+                </div>
+                <h3>{formatCurrency(currentValue, displayCurrency)}</h3>
+                <div className="kpi-card-foot">
+                  <span className="kpi-indicator" />
+                  <span>{t(card.key === 'netProfit' ? 'Gross profit less expenses' : card.key === 'cashFlow' ? 'Collections less expenses' : 'Month to date')}</span>
+                </div>
+                <small className={`kpi-comparison ${comparison.tone}`} title={Number.isFinite(previousValue) ? `Previous month to date: ${formatCurrency(previousValue, displayCurrency)}` : undefined}>
+                  {comparison.label}
+                </small>
+              </motion.article>
+            })()
           ))}
+        </section>}
+
+        {selectedView === 'overview' && <section className="dashboard-secondary-metrics" aria-label={t('Daily activity')}>
+          <article className="dashboard-secondary-card"><span>{t(chartRange === 'today' ? "Today's Sales" : 'Selected Period Sales')}</span><strong>{formatCurrency((chartRange === 'today' ? dashboard.metrics.todaySales : dashboard.metrics.revenue) || 0, displayCurrency)}</strong><small>{t(chartRange === 'today' ? 'Sales recorded today' : 'Sales recorded in selected period')}</small></article>
+          <article className="dashboard-secondary-card stock-alert"><span>{t('Low Stock')}</span><strong>{dashboard.metrics.lowStock || 0}<small> / {dashboard.metrics.productCount || 0}</small></strong><small>{t('Products at or below reorder level')}</small></article>
         </section>}
 
         {(selectedView === 'overview' || selectedView === 'performance') && <section className={`financial-chart-grid${selectedView !== 'overview' ? ' single-column-grid' : ''}`}>
@@ -1885,22 +2438,45 @@ function App() {
             <div className="panel-header">
             <div><p className="eyebrow">{t('Business Performance')}</p><h3>{t('Revenue, expenses & net profit')}</h3></div>
               <div className="chart-filters">
-                <div className="range-pills" role="group" aria-label={t('Chart date range')}>
-                  {[['7days', '7D'], ['30days', '30D'], ['90days', '90D'], ['custom', t('Custom')]].map(([range, label]) => (
-                    <button type="button" key={range} className={chartRange === range ? 'range-pill active' : 'range-pill'} aria-pressed={chartRange === range} onClick={() => range === 'custom' ? loadDashboardChart('custom', todayDate) : loadDashboardChart(range, todayDate)}>{label}</button>
-                  ))}
-                </div>
+                <select
+                  aria-label={t('Chart date range')}
+                  value={chartRange}
+                  onChange={(event) => {
+                    const value = event.target.value
+                    if (value === 'custom') {
+                      loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)
+                    } else {
+                      loadDashboardChart(value, todayDate)
+                    }
+                  }}
+                  disabled={chartLoading}
+                >
+                  <option value="today">{t('Today')}</option>
+                  <option value="yesterday">{t('Yesterday')}</option>
+                  <option value="thisWeek">{t('This Week')}</option>
+                  <option value="lastWeek">{t('Last Week')}</option>
+                  <option value="month">{t('This Month')}</option>
+                  <option value="lastMonth">{t('Last Month')}</option>
+                  <option value="thisQuarter">{t('This Quarter')}</option>
+                  <option value="thisYear">{t('This Year')}</option>
+                  <option value="custom">{t('Custom Date Range')}</option>
+                </select>
                 {chartRange === 'custom' && (
                   <div className="custom-date-range">
                     <label><span className="sr-only">{t('Start date')}</span><input aria-label={t('Start date')} type="date" value={customChartStart} max={customChartEnd} onChange={(event) => setCustomChartStart(event.target.value)} /></label>
                     <span>–</span>
                     <label><span className="sr-only">{t('End date')}</span><input aria-label={t('End date')} type="date" value={customChartEnd} max={todayDate} min={customChartStart} onChange={(event) => setCustomChartEnd(event.target.value)} /></label>
-                    <button type="button" className="range-apply-button" onClick={() => loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)}>{t('Apply')}</button>
+                    <button type="button" className="range-apply-button" onClick={() => loadDashboardChart('custom', todayDate, customChartStart, customChartEnd)} disabled={chartLoading}>{t('Apply')}</button>
+                    <button type="button" className="ghost-button small" onClick={() => loadDashboardChart('month', todayDate)} disabled={chartLoading}>{t('Reset')}</button>
                   </div>
                 )}
               </div>
             </div>
-            <PerformanceGraph chart={dashboard.chart} currencyCode={displayCurrency} language={language} />
+            <div className="financial-chart-content" aria-busy={chartLoading}>
+              {chartLoading && <p className="dashboard-chart-status" role="status">{t('Updating financial chart')}</p>}
+              {chartError && <p className="dashboard-chart-error" role="alert">{chartError} <button type="button" className="text-action" onClick={() => loadDashboardChart(chartRange, chartDate, customChartStart, customChartEnd)} disabled={chartLoading}>{t('Retry')}</button></p>}
+              <PerformanceGraph chart={dashboard.chart} currencyCode={displayCurrency} language={language} />
+            </div>
           </div>
           {selectedView === 'overview' && <ExpenseBreakdown expenses={dashboard.expenseBreakdown} currencyCode={displayCurrency} language={language} />}
         </section>}
@@ -1910,12 +2486,12 @@ function App() {
             <div><p className="eyebrow">{t('Recent activity')}</p><h3>{t('Recent Transactions')}</h3></div>
             <div className="financial-transaction-tools">
               <label className="transaction-filter-select"><span className="sr-only">{t('Filter by category')}</span>
-                <select value={transactionCategoryFilter} onChange={(event) => setTransactionCategoryFilter(event.target.value)} aria-label={t('Filter by category')}>
+                <select value={transactionCategoryFilter} onChange={(event) => { setTransactionCategoryFilter(event.target.value); setTransactionPage(1) }} aria-label={t('Filter by category')}>
                   <option value="">{t('All categories')}</option>
                   {categories.map((category) => <option key={category} value={category}>{category}</option>)}
                 </select>
               </label>
-              <button type="button" className="sort-transactions-button" onClick={() => setTransactionSortDirection((value) => value === 'desc' ? 'asc' : 'desc')}>{t('Date')} {transactionSortDirection === 'desc' ? '↓' : '↑'}</button>
+              <button type="button" className="sort-transactions-button" onClick={() => { setTransactionSortDirection((value) => value === 'desc' ? 'asc' : 'desc'); setTransactionPage(1) }}>{t('Date')} {transactionSortDirection === 'desc' ? '↓' : '↑'}</button>
             </div>
           </div>
           <div className="financial-transactions-scroll">
@@ -1926,7 +2502,7 @@ function App() {
                 <th>{t('Category')}</th><th>{t('Amount')}</th><th>{t('Status')}</th>
               </tr></thead>
               <tbody>
-                {visibleDashboardTransactions.map((item) => (
+                {pagedDashboardTransactions.map((item) => (
                   <tr key={`${item.category}-${item.id}`}>
                     <td className="transaction-id">{item.id}</td><td className="transaction-description">{item.description}</td>
                     <td>{new Date(`${String(item.date).slice(0, 10)}T00:00:00`).toLocaleDateString(language === 'sw' ? 'sw-TZ' : 'en-TZ', { day: '2-digit', month: 'short', year: 'numeric' })}</td>
@@ -1939,6 +2515,10 @@ function App() {
               </tbody>
             </table>
           </div>
+          {visibleDashboardTransactions.length > transactionPageSize && <footer className="transaction-pagination">
+            <span>{t('Showing')} {(transactionPage - 1) * transactionPageSize + 1} to {Math.min(transactionPage * transactionPageSize, visibleDashboardTransactions.length)} {t('of')} {visibleDashboardTransactions.length}</span>
+            <div><button type="button" className="ghost-button small" onClick={() => setTransactionPage((page) => Math.max(1, page - 1))} disabled={transactionPage <= 1}>{t('Previous')}</button><span>{transactionPage} / {transactionPageCount}</span><button type="button" className="ghost-button small" onClick={() => setTransactionPage((page) => Math.min(transactionPageCount, page + 1))} disabled={transactionPage >= transactionPageCount}>{t('Next')}</button></div>
+          </footer>}
         </section>}
 
         {selectedView === 'subscription' && <section className="panel subscription-panel page-section">
@@ -1967,9 +2547,9 @@ function App() {
                 <tbody>
                   {products.map((row) => (
                     <tr key={row.sku}>
-                      <td>{row.name}</td><td>{row.sku}</td><td>{row.stock}</td><td>{formatCurrency(row.sellingPrice, displayCurrency)}</td>
+                      <td><div className="admin-product-identity"><ProductImageView product={row} className="admin-product-thumbnail" /><span>{row.name}</span></div></td><td>{row.sku}</td><td>{row.stock}</td><td>{formatCurrency(row.sellingPrice, displayCurrency)}</td>
                       <td><span className={row.stock <= row.reorderLevel ? 'status-badge danger' : 'status-badge ok'}>{row.stock <= row.reorderLevel ? t('Review stock') : t('Healthy')}</span></td>
-                      <td><button type="button" className="text-action" onClick={() => { setProductToRestock(row); setModal('restock') }}>{t('Restock')}</button></td>
+                      <td><div className="admin-product-actions"><button type="button" className="text-action" onClick={() => { setProductToEditImage(row); setModal('product-image') }}>{t('Edit image')}</button><button type="button" className="text-action" onClick={() => { setProductToRestock(row); setModal('restock') }}>{t('Restock')}</button></div></td>
                     </tr>
                   ))}
                   {products.length === 0 && <tr><td colSpan="6" className="empty-table">{t('No products have been added yet.')}</td></tr>}
@@ -1980,44 +2560,50 @@ function App() {
 
         </section>}
 
-        {selectedView === 'sales' && <section className="bottom-grid single-column-grid">
-          <div className={`panel pos-panel${drawerOpen ? ' drawer-open' : ''}`}>
-            <div className="panel-header">
-              <div><p className="eyebrow">{t('Fast sales')}</p><h3>POS</h3></div>
-              <button type="button" className="ghost-button" aria-expanded={drawerOpen} onClick={() => setDrawerOpen((open) => !open)}>
-                {drawerOpen ? t('Close drawer') : t('Open drawer')}
-              </button>
+        {selectedView === 'sales' && <section className="sales-pos-layout">
+          <div className="panel pos-catalog-panel">
+            <div className="pos-catalog-heading">
+              <div><p className="eyebrow">{t('Fast sales')}</p><h2>{t('Product Catalog')}</h2><p>{visiblePosProducts.length} {t('products available')}</p></div>
+              <button type="button" className="ghost-button pos-mobile-cart-toggle" onClick={() => setCartDrawerOpen((open) => !open)} aria-expanded={cartDrawerOpen}>{t('Shopping Cart')} <span className="pos-cart-badge">{cart.length}</span></button>
             </div>
-            {drawerOpen && <p className="drawer-status" role="status">{t('Cash drawer ready for checkout.')}</p>}
-            <div className="pos-grid">
-              {posProducts.map((product) => (
-                <button type="button" key={product.label} className="pos-item" onClick={() => addToCart(product)} aria-label={`Add ${product.label} to sale`}>
-                  <span className={`item-dot ${product.tone}`} />
-                  <strong>{product.label}</strong>
-                  <small>{formatCurrency(product.price, displayCurrency)}</small>
-                  <em>{product.stock} left</em>
-                </button>
-              ))}
+            <form className="pos-product-search pos-catalog-search" onSubmit={(event) => { event.preventDefault(); setPosProductQuery(posProductSearch) }} role="search">
+              <label htmlFor="pos-product-search">{t('Search products')}</label>
+              <div><input id="pos-product-search" type="search" value={posProductSearch} onChange={(event) => { setPosProductSearch(event.target.value); setPosProductQuery(event.target.value) }} placeholder={t('Search by product name or SKU')} /><button type="submit" className="primary-button small">{t('Search')}</button></div>
+            </form>
+            <div className="pos-category-filters" role="group" aria-label={t('Filter products by category')}>
+              <button type="button" className={productCategoryFilter === '' ? 'pos-category-filter active' : 'pos-category-filter'} aria-pressed={productCategoryFilter === ''} onClick={() => setProductCategoryFilter('')}>{t('All products')}</button>
+              {productCategories.map((category) => <button type="button" key={category.id} className={productCategoryFilter === category.id ? 'pos-category-filter active' : 'pos-category-filter'} aria-pressed={productCategoryFilter === category.id} onClick={() => setProductCategoryFilter(category.id)}>{category.name}</button>)}
             </div>
-            <div className="cart-wrap">
-              <div className="cart-row"><span>{t('Cart total')}</span><strong>{formatCurrency(cartTotal, displayCurrency)}</strong></div>
-              {cart.length === 0 && <p className="empty-cart">{t('Your cart is empty. Select a product to start a sale.')}</p>}
-              {cart.map((item) => (
-                <div className="cart-item" key={item.name}>
-                  <span>{item.name}</span>
-                  <div className="quantity-controls">
-                    <button type="button" aria-label={`Remove one ${item.name}`} onClick={() => changeQuantity(item.name, -1)}>−</button>
-                    <span>{item.qty}</span>
-                    <button type="button" aria-label={`Add one ${item.name}`} onClick={() => changeQuantity(item.name, 1)}>+</button>
-                  </div>
-                  <strong>{formatCurrency(item.price * item.qty, displayCurrency)}</strong>
-                </div>
-              ))}
-              <button type="button" className="primary-button large" onClick={() => completeSale()}>{t('COMPLETE SALE')}</button>
+            <div className="pos-product-grid">
+              {visiblePosProducts.map((product) => <article className="pos-product-card" key={product.id}>
+                <div className="pos-product-art"><ProductImageView product={product} className="product-art-image" /></div>
+                <div className="pos-product-card-copy"><strong title={product.label}>{product.label}</strong><small>{product.sku || t('No SKU')}</small></div>
+                <div className="pos-product-card-meta"><strong>{formatCurrency(product.price, displayCurrency)}</strong><span className={product.stock <= product.reorderLevel ? 'pos-stock low' : 'pos-stock'}>{product.stock > 0 ? product.stock + ' ' + t('in stock') : t('Out of stock')}</span></div>
+                <button type="button" className="pos-add-button" onClick={() => addToCart(product)} disabled={product.stock <= 0 || saleSubmitting}>{product.stock > 0 ? t('Add to cart') : t('Unavailable')}</button>
+              </article>)}
+              {!visiblePosProducts.length && <p className="pos-search-empty">{!productsLoaded ? t('Loading products...') : products.length ? t('No matching products found.') : t('No products have been added yet.')}</p>}
             </div>
           </div>
-        </section>
-        }
+
+          {cartDrawerOpen && <button type="button" className="pos-cart-backdrop" aria-label={t('Close cart')} onClick={() => setCartDrawerOpen(false)} />}
+          <aside className={cartDrawerOpen ? 'panel pos-cart-panel mobile-cart-open' : 'panel pos-cart-panel'} role={cartDrawerOpen ? 'dialog' : undefined} aria-modal={cartDrawerOpen ? 'true' : undefined} aria-label={t('Shopping Cart')}>
+            <div className="pos-cart-heading"><div><p className="eyebrow">{t('Checkout')}</p><h2>{t('Shopping Cart')}</h2></div><span className="pos-cart-badge">{cart.length}</span><button type="button" className="pos-cart-close" onClick={() => setCartDrawerOpen(false)} aria-label={t('Close cart')}>&times;</button></div>
+            <button type="button" className="pos-clear-cart" onClick={clearCart} disabled={!cart.length || saleSubmitting}>{t('Clear cart')}</button>
+            <div className="pos-cart-items" aria-live="polite">
+              {cart.length === 0 ? <div className="pos-empty-cart"><span><Package size={28} /></span><strong>{t('Your cart is empty')}</strong><p>{t('Select a product to start a sale.')}</p></div> : cart.map((item) => <article className="pos-cart-item" key={item.id}>
+                <div className="pos-cart-item-top"><ProductImageView product={item} className="pos-cart-product-image" /><div><strong>{item.name}</strong><small>{formatCurrency(item.price, displayCurrency)} {t('each')}</small></div><button type="button" className="pos-remove-item" onClick={() => changeQuantity(item.id, -item.qty)} aria-label={t('Remove item')}>?</button></div>
+                <div className="pos-cart-item-bottom"><div className="quantity-controls"><button type="button" aria-label={t('Decrease quantity')} onClick={() => changeQuantity(item.id, -1)}>?</button><span>{item.qty}</span><button type="button" aria-label={t('Increase quantity')} onClick={() => changeQuantity(item.id, 1)} disabled={item.qty >= item.stock}>+</button></div><strong>{formatCurrency(item.price * item.qty, displayCurrency)}</strong></div>
+              </article>)}
+            </div>
+            <div className="pos-cart-summary">
+              <div><span>{t('Subtotal')}</span><strong>{formatCurrency(cartTotal, displayCurrency)}</strong></div>
+              <div className="pos-total-row"><span>{t('Total payable')}</span><strong>{formatCurrency(cartTotal, displayCurrency)}</strong></div>
+              <label>{t('Customer name (optional)')}<input value={saleCustomer} onChange={(event) => setSaleCustomer(event.target.value)} maxLength="150" placeholder={t('Walk-in customer')} /></label>
+              <label>{t('Payment method')}<select value={salePaymentMethod} onChange={(event) => setSalePaymentMethod(event.target.value)}><option value="cash">{t('Cash')}</option><option value="mobile_money">{t('Mobile money')}</option><option value="card">{t('Card')}</option><option value="bank_transfer">{t('Bank transfer')}</option><option value="other">{t('Other')}</option></select></label>
+              <button type="button" className="primary-button large pos-checkout-button" onClick={() => completeSale(saleCustomer.trim() || 'Walk-in customer', salePaymentMethod)} disabled={!cart.length || cart.some((item) => item.stock < 1 || item.qty > item.stock) || saleSubmitting}>{saleSubmitting ? t('Processing sale...') : t('COMPLETE SALE')}</button>
+            </div>
+          </aside>
+        </section>}
 
         {selectedView === 'transactions' && <section className="panel recent-panel">
           <div className="panel-header">
@@ -2129,13 +2715,19 @@ function App() {
                   <strong>Business logo</strong>
                   <p className="section-description">Upload a PNG, JPEG, or WebP image up to 5 MB. The logo appears in both Business Admin and Sales Agent panels.</p>
                 </div>
-                {business?.logoUpdatedAt && <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt={`${business.name} logo preview`} className="business-logo-preview" />}
+                {pendingBusinessLogoPreview || business?.logoUpdatedAt
+                  ? <img src={pendingBusinessLogoPreview || `/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt={`${business.name} logo preview`} className="business-logo-preview" />
+                  : <span className="business-logo-preview business-logo-fallback" aria-label={t('Default business logo')}>▧</span>}
                 <div className="business-logo-actions">
                   <label className="ghost-button business-logo-upload">
-                    {logoUploading ? 'Uploading…' : business?.logoUpdatedAt ? 'Replace logo' : 'Upload logo'}
-                    <input type="file" accept="image/png,image/jpeg,image/webp" onChange={uploadBusinessLogo} disabled={logoUploading} />
+                    {pendingBusinessLogo ? t('Choose another image') : business?.logoUpdatedAt ? t('Replace logo') : t('Upload logo')}
+                    <input type="file" accept="image/png,image/jpeg,image/webp" onChange={selectBusinessLogo} disabled={logoUploading} />
                   </label>
-                  {business?.logoUpdatedAt && <button type="button" className="text-action danger-action" onClick={removeBusinessLogo} disabled={logoUploading}>Remove logo</button>}
+                  {pendingBusinessLogo && <>
+                    <button type="button" className="primary-button small" onClick={saveBusinessLogo} disabled={logoUploading}>{logoUploading ? t('Uploading…') : t('Save logo')}</button>
+                    <button type="button" className="ghost-button small" onClick={() => setPendingBusinessLogo(null)} disabled={logoUploading}>{t('Cancel')}</button>
+                  </>}
+                  {business?.logoUpdatedAt && !pendingBusinessLogo && <button type="button" className="text-action danger-action" onClick={removeBusinessLogo} disabled={logoUploading}>{t('Remove logo')}</button>}
                 </div>
               </div>
               <div className="settings-fields">
@@ -2235,7 +2827,7 @@ function App() {
           />
         ))}
       </main>
-      {modal && <Modal type={modal} setupRequired={setupRequired} currencyCode={displayCurrency} onClose={() => { setModal(''); setProductToRestock(null) }} onAddProduct={addProduct} onAddAgent={addAgent} onAddExpense={addExpense} onRestockProduct={restockProduct} restockProduct={productToRestock} />}
+      {modal && <Modal type={modal} setupRequired={setupRequired} currencyCode={displayCurrency} product={productToEditImage} maxProductImageBytes={productImageMaxBytes} productImageBusy={productImageBusy} onSaveProductImage={saveProductImage} onClose={() => { setModal(''); setProductToRestock(null); setProductToEditImage(null) }} onAddProduct={addProduct} onAddAgent={addAgent} onAddExpense={addExpense} onRestockProduct={restockProduct} restockProduct={productToRestock} />}
       {agentToDelete && <DeleteAgentDialog agent={agentToDelete} onCancel={() => setAgentToDelete(null)} onConfirm={deleteAgent} />}
       {agentToReset && (
         <ResetPasswordDialog
@@ -2867,7 +3459,7 @@ function BusinessDetailsPage({ business, onBack, onChangeAccess, onSuspend, onRe
           <p className="section-description">
             {business.status === 'approved'
               ? 'This application was approved, but no business account exists for it — the account may have been deleted or never created. Review the record in Applications &amp; approvals.'
-              : 'This business has applied to join KAJUNA BMS and is waiting for your approval. Approving the application creates the business account and lets the owner sign in — until then nobody from this business can access the platform.'}
+              : 'This business has applied to join the platform and is waiting for your approval. Approving the application creates the business account and lets the owner sign in — until then nobody from this business can access the platform.'}
           </p>
           <div className="detail-action-row">
             <button type="button" className="primary-button" onClick={onReviewApplication}>Review in Applications &amp; approvals</button>
@@ -2931,7 +3523,7 @@ function BusinessDetailsPage({ business, onBack, onChangeAccess, onSuspend, onRe
   )
 }
 
-function OwnerConsole({ user, businesses, applications, settings, onSignOut, onChangeAccess, onDeleteBusiness, onResetAdminPassword, onApproveApplication, onRejectApplication, onUpdateSubscriptionSettings, onRecordPayment, onVerifyPayment, onRefresh, theme, language, onThemeChange, onLanguageChange }) {
+function OwnerConsole({ user, businesses, applications, settings, onSignOut, onChangeAccess, onDeleteBusiness, onResetAdminPassword, onApproveApplication, onRejectApplication, onUpdateSubscriptionSettings, onRecordPayment, onVerifyPayment, onRefresh, theme, language, onThemeChange, onLanguageChange, onProfileImageUpdated, onChangePassword, onNotice }) {
   const t = (text) => translate(text, language)
   const [businessToDelete, setBusinessToDelete] = useState(null)
   const [businessToReset, setBusinessToReset] = useState(null)
@@ -2985,9 +3577,15 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
     }))
   const overviewBusinesses = [...applicationRows, ...businesses]
   const openBusiness = overviewBusinesses.find((business) => business.id === selectedBusinessId) || null
-  const [ownerView, setOwnerView] = useState(
-    () => applications.some((application) => application.status === 'pending') ? 'applications' : 'businesses',
-  )
+  const [ownerView, setOwnerView] = useState('businesses')
+  const ownerViewInitializedRef = useRef(false)
+  useEffect(() => {
+    if (ownerViewInitializedRef.current) return
+    if (!applications.length) return
+    ownerViewInitializedRef.current = true
+    if (applications.some((application) => application.status === 'pending')) setOwnerView('applications')
+  }, [applications])
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [filterQuery, setFilterQuery] = useState('')
   const [accessFilter, setAccessFilter] = useState('all')
   const [paymentFilter, setPaymentFilter] = useState('all')
@@ -3038,10 +3636,16 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
 
   return (
     <div className="owner-shell">
-      <aside id="owner-navigation" className={`owner-sidebar${mobileNavigationOpen ? ' mobile-open' : ''}`}>
+      {pendingApplications.length > 0 && ownerView !== 'applications' && (
+        <div className="owner-pending-banner" role="status">
+          <span>{pendingApplications.length} business application{pendingApplications.length === 1 ? '' : 's'} awaiting approval.</span>
+          <button type="button" className="primary-button small" onClick={() => { setSelectedBusinessId(null); setOwnerView('applications') }}>Review now</button>
+        </div>
+      )}
+      <UnifiedSidebar id="owner-navigation" className="owner-sidebar" open={mobileNavigationOpen} collapsed={sidebarCollapsed} onClose={() => setMobileNavigationOpen(false)} onToggleCollapsed={() => setSidebarCollapsed((value) => !value)} closeLabel={t('Close navigation')} collapseLabel={t('Collapse navigation')} expandLabel={t('Expand navigation')} signOutLabel={t('Sign out')} onSignOut={onSignOut} brand={<><span className="unified-brand-mark">B</span><span className="unified-brand-copy"><strong>Business Management</strong><small>Platform owner</small></span></>} profile={<div className="account-controls"><ProfileImageControl user={user} language={language} onUpdated={onProfileImageUpdated} onNotice={onNotice} /><button type="button" className="ghost-button account-password-button" onClick={() => setOwnerChangePasswordOpen(true)}>{t('Change password')}</button></div>}>
         <div className="brand-area">
-          <div className="brand-mark">K</div>
-          <div><strong>KAJUNA</strong><span>BMS · Owner</span></div>
+          <div className="brand-mark">B</div>
+          <div><strong>Business Management</strong><span>Platform owner</span></div>
           <button
             type="button"
             className="mobile-navigation-close"
@@ -3057,7 +3661,7 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
             aria-current={ownerView === 'applications' ? 'page' : undefined}
             onClick={() => { setSelectedBusinessId(null); setOwnerView('applications'); setMobileNavigationOpen(false) }}
           >
-            <span>{t('Applications & approvals')}</span>
+            <span className="nav-item-icon" aria-hidden="true">▦</span><span>{t('Applications & approvals')}</span>{pendingApplications.length > 0 && <span className="owner-nav-badge">{pendingApplications.length}</span>}
             {pendingApplications.length > 0 && <span className="owner-nav-badge">{pendingApplications.length}</span>}
           </button>
           <button
@@ -3066,7 +3670,7 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
             aria-current={ownerView === 'businesses' ? 'page' : undefined}
             onClick={() => { setSelectedBusinessId(null); setOwnerView('businesses'); setMobileNavigationOpen(false) }}
           >
-            <span>{t('Businesses & subscriptions')}</span>
+            <span className="nav-item-icon" aria-hidden="true">▣</span><span>{t('Businesses & subscriptions')}</span>
           </button>
           <button
             type="button"
@@ -3074,17 +3678,10 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
             aria-current={ownerView === 'settings' ? 'page' : undefined}
             onClick={() => { setSelectedBusinessId(null); setOwnerView('settings'); setMobileNavigationOpen(false) }}
           >
-            <span>{t('Subscription settings')}</span>
+            <span className="nav-item-icon" aria-hidden="true">⚙</span><span>{t('Subscription settings')}</span>
           </button>
         </nav>
-        <div className="owner-sidebar-account">
-          <div className="user-chip">
-            <span className="mini-avatar">{user.name.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span>
-            <div><strong>{user.name}</strong><small>{t('System owner')}</small></div>
-          </div>
-          <button type="button" className="sidebar-signout" onClick={onSignOut}>{t('Sign out')}</button>
-        </div>
-      </aside>
+      </UnifiedSidebar>
       {mobileNavigationOpen && (
         <>
           <button
@@ -3113,8 +3710,9 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
           >
             <span /><span /><span />
           </button>
-          <div><p className="eyebrow">{t('Platform administration')}</p><h2>KAJUNA BMS</h2></div>
+          <div><p className="eyebrow">{t('Platform administration')}</p><h2>Business Management Portal</h2></div>
           <div className="topbar-tools">
+            <div className="owner-header-profile"><UserAvatar user={user} /><span>{user.name}</span></div>
             <PreferenceControls theme={theme} language={language} onThemeChange={onThemeChange} onLanguageChange={onLanguageChange} />
             <button type="button" className="ghost-button" onClick={onRefresh}>{t('Refresh')}</button>
           </div>
@@ -3209,7 +3807,7 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
         ) : (
           <>
             <section className="page-header">
-              <div><p className="eyebrow">System owner workspace</p><h1>Customer accounts</h1><p className="section-description">Review every business account on KAJUNA BMS. Open a business with the ⋮ menu to view its details and manage access, passwords, billing, or permanent deletion.</p></div>
+              <div><p className="eyebrow">System owner workspace</p><h1>Customer accounts</h1><p className="section-description">Review every business account on the platform. Open a business with the ⋮ menu to view its details and manage access, passwords, billing, or permanent deletion.</p></div>
               <div className="header-status"><span className="status-dot" />Owner access</div>
             </section>
             <section className="stats-grid owner-stats">
@@ -3220,7 +3818,7 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
             </section>
             <section className="panel owner-business-panel">
               <div className="panel-header">
-                <div><p className="eyebrow">Customer accounts</p><h3>Businesses on KAJUNA BMS</h3></div>
+                <div><p className="eyebrow">Customer accounts</p><h3>Businesses on the platform</h3></div>
                 <span className="owner-table-count">{filteredBusinesses.length} shown</span>
               </div>
               <div className="owner-toolbar">
@@ -3347,30 +3945,65 @@ function OwnerConsole({ user, businesses, applications, settings, onSignOut, onC
   )
 }
 
-function AgentWorkspace({ agent, business, products, debtProducts, customers, cart, cartTotal, transactions, currencyCode, expenseDialogOpen, onOpenExpense, onCloseExpense, onAddExpense, debtActionBusy, onAddAgentDebt, onAddAgentCustomer, onChangePassword, onAddProduct, onChangeQuantity, onCompleteSale, onExit, theme, language, onThemeChange, onLanguageChange }) {
+function AgentWorkspace({ agent, business, products, productsLoaded, productCategories, debtProducts, customers, cart, cartTotal, saleSubmitting, transactions, currencyCode, expenseDialogOpen, onOpenExpense, onCloseExpense, onAddExpense, debtActionBusy, onAddAgentDebt, onAddAgentCustomer, onChangePassword, onProfileImageUpdated, onNotice, onAddProduct, onChangeQuantity, onClearCart, onCompleteSale, onRefresh, onExit, theme, language, onThemeChange, onLanguageChange }) {
+  const reduceMotion = useReducedMotion()
   const t = (text) => translate(text, language)
   const [customer, setCustomer] = useState('')
+  const [paymentMethod, setPaymentMethod] = useState('cash')
   const [navigationOpen, setNavigationOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [debitPickerOpen, setDebitPickerOpen] = useState(false)
   const [agentCustomerOpen, setAgentCustomerOpen] = useState(false)
   const [selectedDebtCustomer, setSelectedDebtCustomer] = useState(null)
   const [accountOpen, setAccountOpen] = useState(false)
   const [changePasswordOpen, setChangePasswordOpen] = useState(false)
+  const [productSearch, setProductSearch] = useState('')
+  const [categoryFilter, setCategoryFilter] = useState('')
+  const [mobileCartOpen, setMobileCartOpen] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const refreshInProgressRef = useRef(false)
+  const normalizedProductQuery = productSearch.trim().replace(/\s+/g, ' ').toLowerCase()
+  const visibleProducts = products.filter((product) => {
+    const searchableProductText = [product.label, product.sku, product.barcode].filter(Boolean).join(' ').toLowerCase()
+    const matchesSearch = !normalizedProductQuery || searchableProductText.includes(normalizedProductQuery)
+    return matchesSearch && (!categoryFilter || product.categoryId === categoryFilter)
+  })
+  const cartItemCount = cart.reduce((count, item) => count + item.qty, 0)
+
+  async function handleRefresh() {
+    if (refreshInProgressRef.current) return
+    refreshInProgressRef.current = true
+    setRefreshing(true)
+    try {
+      const refreshed = await onRefresh()
+      if (refreshed !== false) onNotice(t('Sales workspace refreshed.'))
+    } catch (error) {
+      onNotice(error.message)
+    } finally {
+      refreshInProgressRef.current = false
+      setRefreshing(false)
+    }
+  }
+
+  async function handleCompleteAgentSale() {
+    const completed = await onCompleteSale(customer.trim() || 'Walk-in customer', paymentMethod)
+    if (completed) {
+      setCustomer('')
+      setMobileCartOpen(false)
+    }
+  }
 
   useEffect(() => {
-    if (!navigationOpen) return undefined
+    if (!navigationOpen && !mobileCartOpen) return undefined
     function closeOnEscape(event) {
-      if (event.key === 'Escape') setNavigationOpen(false)
+      if (event.key === 'Escape') {
+        setNavigationOpen(false)
+        setMobileCartOpen(false)
+      }
     }
     window.addEventListener('keydown', closeOnEscape)
     return () => window.removeEventListener('keydown', closeOnEscape)
-  }, [navigationOpen])
-
-  function submitSale(event) {
-    event.preventDefault()
-    onCompleteSale(customer.trim() || 'Walk-in customer')
-    setCustomer('')
-  }
+  }, [navigationOpen, mobileCartOpen])
 
   return (
     <div className="agent-app">
@@ -3386,11 +4019,11 @@ function AgentWorkspace({ agent, business, products, debtProducts, customers, ca
         <span aria-hidden="true">☰</span>
       </button>
       <div className="business-brand">
-        {business?.logoUpdatedAt && <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo" />}
+        {business?.logoUpdatedAt ? <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo" /> : <span className="business-brand-fallback" aria-hidden="true">▧</span>}
         <strong>{business?.name || agent.businessName}</strong>
       </div>
       <div className="agent-account">
-        <span className="mini-avatar">{agent.name.split(' ').map((part) => part[0]).join('').slice(0, 2)}</span>
+        <UserAvatar user={agent} />
         <div><strong>{agent.name}</strong><small>{t('Sales agent')}</small></div>
       </div>
       <PreferenceControls theme={theme} language={language} onThemeChange={onThemeChange} onLanguageChange={onLanguageChange} />
@@ -3399,14 +4032,14 @@ function AgentWorkspace({ agent, business, products, debtProducts, customers, ca
         createPortal(<div className="agent-navigation-backdrop" onMouseDown={(event) => {
           if (event.target === event.currentTarget) setNavigationOpen(false)
         }}>
-          <nav id="agent-navigation" className="agent-navigation" aria-label={t('Sales agent navigation')}>
+          <UnifiedSidebar id="agent-navigation" className="agent-navigation" open collapsed={sidebarCollapsed} onClose={() => setNavigationOpen(false)} onToggleCollapsed={() => setSidebarCollapsed((value) => !value)} closeLabel={t('Close navigation')} collapseLabel={t('Collapse navigation')} expandLabel={t('Expand navigation')} signOutLabel={t('Sign out')} onSignOut={() => { setNavigationOpen(false); onExit() }} brand={<>{business?.logoUpdatedAt ? <img src={`/api/business/logo?v=${encodeURIComponent(business.logoUpdatedAt)}`} alt="" className="business-brand-logo unified-business-logo" /> : <span className="unified-brand-mark">B</span>}<span className="unified-brand-copy"><strong title={business?.name || agent.businessName || 'My Business'}>{business?.name || agent.businessName || 'My Business'}</strong><small>Sales agent</small></span></>} profile={<div className="account-controls"><ProfileImageControl user={agent} language={language} onUpdated={onProfileImageUpdated} onNotice={onNotice} /><button type="button" className="ghost-button account-password-button" onClick={() => setChangePasswordOpen(true)}>{t('Change password')}</button></div>}>
             <div className="agent-navigation-heading">
               <strong>{t('Menu')}</strong>
               <button type="button" className="modal-close" aria-label={t('Close navigation')} onClick={() => setNavigationOpen(false)}>×</button>
             </div>
             <button type="button" className="agent-navigation-item" onClick={() => {
               setNavigationOpen(false)
-              document.getElementById('agent-sale')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              document.getElementById('agent-sale')?.scrollIntoView({ behavior: reduceMotion ? 'instant' : 'smooth', block: 'start' })
             }}>
               <span aria-hidden="true">＋</span>{t('Add Sale')}
             </button>
@@ -3434,47 +4067,60 @@ function AgentWorkspace({ agent, business, products, debtProducts, customers, ca
             }}>
               <span aria-hidden="true">↪</span>{t('Sign out')}
             </button>
-          </nav>
+          </UnifiedSidebar>
         </div>, document.body)
       )}
       <main className="agent-content">
         <section className="page-header agent-page-heading">
           <div><p className="eyebrow">{t('Sales workspace')}</p><h1>{t('Welcome,')} {agent.name.split(' ')[0]}</h1><p className="section-description">{t('Create a sale, take payment, and review your completed transactions.')}</p></div>
-          <div className="header-status"><span className="status-dot" />{t('Agent account active')}</div>
+          <div className="header-status"><span className="status-dot" />{t('Agent account active')}</div><button type="button" className="ghost-button agent-refresh-button" onClick={handleRefresh} disabled={refreshing} aria-label={t(refreshing ? 'Refreshing…' : 'Refresh sales workspace')} title={t('Refresh sales workspace')}><RefreshCw size={16} className={refreshing ? 'agent-refresh-spinning' : ''} />{refreshing ? t('Refreshing…') : t('Refresh')}</button>
         </section>
         <div className="agent-stat-grid">
           <article className="stat-card blue"><div className="stat-info"><p>{t('Sales completed')}</p><h3>{transactions.length}</h3></div><span className="stat-delta">{t('Your transactions')}</span></article>
           <article className="stat-card indigo"><div className="stat-info"><p>{t('Sales today')}</p><h3>{formatCurrency(transactions.reduce((total, sale) => total + sale.amount, 0), currencyCode)}</h3></div><span className="stat-delta">{currencyCode}</span></article>
         </div>
-        <section className="agent-work-grid">
-          <div className="panel agent-products">
-            <div className="panel-header"><div><p className="eyebrow">{t('Available products')}</p><h3>{t('Start a sale')}</h3></div></div>
-            <div className="agent-product-grid">
-              {products.map((product) => (
-                <button type="button" className="agent-product-card" key={product.label} onClick={() => onAddProduct(product)} disabled={product.stock <= 0}>
-                  <span className={`item-dot ${product.tone}`} /><strong>{product.label}</strong><span>{formatCurrency(product.price, currencyCode)}</span><small>{product.stock} {t('available')}</small>
-                </button>
-              ))}
+        <section className="sales-pos-layout agent-sales-pos-layout" id="agent-sale">
+          <div className="panel pos-catalog-panel">
+            <div className="pos-catalog-heading">
+              <div><p className="eyebrow">{t('Available products')}</p><h2>{t('Product Catalog')}</h2><p>{visibleProducts.length} {t('products available')}</p></div>
+              <button type="button" className="ghost-button pos-mobile-cart-toggle" onClick={() => setMobileCartOpen(true)} aria-expanded={mobileCartOpen}><ShoppingCart size={16} />{t('Shopping Cart')} <span className="pos-cart-badge">{cartItemCount}</span></button>
+            </div>
+            <div className="pos-product-search pos-catalog-search" role="search">
+              <label htmlFor="agent-product-search">{t('Search products')}</label>
+              <div className="agent-search-input-wrap"><Search size={17} aria-hidden="true" /><input id="agent-product-search" type="search" value={productSearch} onChange={(event) => setProductSearch(event.target.value)} placeholder={t('Search products by name or SKU...')} />{productSearch && <button type="button" aria-label={t('Clear search')} onClick={() => setProductSearch('')}><X size={16} /></button>}</div>
+            </div>
+            <div className="pos-category-filters" role="group" aria-label={t('Filter products by category')}>
+              <button type="button" className={!categoryFilter ? 'pos-category-filter active' : 'pos-category-filter'} aria-pressed={!categoryFilter} onClick={() => setCategoryFilter('')}>{t('All products')}</button>
+              {productCategories.map((category) => <button type="button" key={category.id} className={categoryFilter === category.id ? 'pos-category-filter active' : 'pos-category-filter'} aria-pressed={categoryFilter === category.id} onClick={() => setCategoryFilter(category.id)}>{category.name}</button>)}
+            </div>
+            <div className="pos-product-grid">
+              {visibleProducts.map((product) => <article className="pos-product-card" key={product.id}>
+                <div className="pos-product-art"><ProductImageView product={product} className="product-art-image" /></div>
+                <div className="pos-product-card-copy"><strong title={product.label}>{product.label}</strong><small>{product.sku || t('No SKU')}</small></div>
+                <div className="pos-product-card-meta"><strong>{formatCurrency(product.price, currencyCode)}</strong><span className={product.stock <= product.reorderLevel ? 'pos-stock low' : 'pos-stock'}>{product.stock > 0 ? product.stock + ' ' + t('in stock') : t('Out of stock')}</span></div>
+                <button type="button" className="pos-add-button" onClick={() => onAddProduct(product)} disabled={product.stock <= 0 || saleSubmitting}>{product.stock > 0 ? t('Add to cart') : t('Unavailable')}</button>
+              </article>)}
+              {!visibleProducts.length && <p className="pos-search-empty">{!productsLoaded ? t('Loading products...') : products.length ? t('No matching products found.') : t('No products have been added yet.')}</p>}
             </div>
           </div>
-          <div className="panel agent-checkout" id="agent-sale">
-            <div className="panel-header"><div><p className="eyebrow">{t('Checkout')}</p><h3>{t('Current sale')}</h3></div></div>
-            <form onSubmit={submitSale}>
-              <label className="agent-customer-field">{t('Customer name (optional)')}<input value={customer} onChange={(event) => setCustomer(event.target.value)} placeholder={t('Walk-in customer')} /></label>
-              <div className="agent-cart">
-                {cart.length === 0 && <p className="empty-cart">{t('Select products to add them to this sale.')}</p>}
-                {cart.map((item) => (
-                  <div className="cart-item" key={item.name}>
-                    <span>{item.name}</span>
-                    <div className="quantity-controls"><button type="button" aria-label={`Remove one ${item.name}`} onClick={() => onChangeQuantity(item.name, -1)}>−</button><span>{item.qty}</span><button type="button" aria-label={`Add one ${item.name}`} onClick={() => onChangeQuantity(item.name, 1)}>+</button></div>
-                    <strong>{formatCurrency(item.price * item.qty, currencyCode)}</strong>
-                  </div>
-                ))}
-              </div>
-              <div className="agent-total"><span>{t('Total due')}</span><strong>{formatCurrency(cartTotal, currencyCode)}</strong></div>
-              <button type="submit" className="primary-button large">{t('COMPLETE SALE')}</button>
-            </form>
-          </div>
+          {mobileCartOpen && <button type="button" className="pos-cart-backdrop" aria-label={t('Close cart')} onClick={() => setMobileCartOpen(false)} />}
+          <aside className={mobileCartOpen ? 'panel pos-cart-panel mobile-cart-open' : 'panel pos-cart-panel'} role={mobileCartOpen ? 'dialog' : undefined} aria-modal={mobileCartOpen ? 'true' : undefined} aria-label={t('Shopping Cart')}>
+            <div className="pos-cart-heading"><div><p className="eyebrow">{t('Checkout')}</p><h2>{t('Shopping Cart')}</h2></div><span className="pos-cart-badge">{cartItemCount}</span><button type="button" className="pos-cart-close" onClick={() => setMobileCartOpen(false)} aria-label={t('Close cart')}>&times;</button></div>
+            <button type="button" className="pos-clear-cart" onClick={onClearCart} disabled={!cart.length || saleSubmitting}>{t('Clear cart')}</button>
+            <div className="pos-cart-items" aria-live="polite">
+              {cart.length === 0 ? <div className="pos-empty-cart"><span><Package size={28} /></span><strong>{t('Your cart is empty')}</strong><p>{t('Select a product to start a sale.')}</p></div> : cart.map((item) => <article className="pos-cart-item" key={item.id}>
+                <div className="pos-cart-item-top"><ProductImageView product={item} className="pos-cart-product-image" /><div><strong>{item.name}</strong><small>{formatCurrency(item.price, currencyCode)} {t('each')}</small></div><button type="button" className="pos-remove-item" onClick={() => onChangeQuantity(item.id, -item.qty)} aria-label={t('Remove item')} disabled={saleSubmitting}>&times;</button></div>
+                <div className="pos-cart-item-bottom"><div className="quantity-controls"><button type="button" aria-label={t('Decrease quantity')} onClick={() => onChangeQuantity(item.id, -1)} disabled={saleSubmitting}>?</button><span>{item.qty}</span><button type="button" aria-label={t('Increase quantity')} onClick={() => onChangeQuantity(item.id, 1)} disabled={saleSubmitting || item.qty >= item.stock}>+</button></div><strong>{formatCurrency(item.price * item.qty, currencyCode)}</strong></div>
+              </article>)}
+            </div>
+            <div className="pos-cart-summary">
+              <div><span>{t('Subtotal')}</span><strong>{formatCurrency(cartTotal, currencyCode)}</strong></div>
+              <div className="pos-total-row"><span>{t('Total due')}</span><strong>{formatCurrency(cartTotal, currencyCode)}</strong></div>
+              <label>{t('Customer name (optional)')}<input value={customer} onChange={(event) => setCustomer(event.target.value)} maxLength="150" placeholder={t('Walk-in customer')} /></label>
+              <label>{t('Payment method')}<select value={paymentMethod} onChange={(event) => setPaymentMethod(event.target.value)}><option value="cash">{t('Cash')}</option><option value="mobile_money">{t('Mobile money')}</option><option value="card">{t('Card')}</option><option value="bank_transfer">{t('Bank transfer')}</option><option value="other">{t('Other')}</option></select></label>
+              <button type="button" className="primary-button large pos-checkout-button" onClick={handleCompleteAgentSale} disabled={!cart.length || cart.some((item) => item.stock < 1 || item.qty > item.stock) || saleSubmitting}>{saleSubmitting ? t('Processing sale...') : t('COMPLETE SALE')}</button>
+            </div>
+          </aside>
         </section>
         <section className="panel recent-panel agent-history">
           <div className="panel-header"><div><p className="eyebrow">{t('Your activity')}</p><h3>{t('Completed sales')}</h3></div></div>
@@ -3945,7 +4591,78 @@ function ResetPasswordDialog({ eyebrow = 'Password recovery', title, description
   )
 }
 
-function Modal({ type, onClose, onAddProduct, onAddAgent, onAddExpense, onRestockProduct, restockProduct, currencyCode = 'TZS' }) {
+function productImageSrc(product) {
+  if (!product?.id) return ''
+  return '/api/products/' + encodeURIComponent(product.id) + '/image' + (product.imageUpdatedAt ? '?v=' + encodeURIComponent(product.imageUpdatedAt) : '')
+}
+
+function ProductImageView({ product, className = '' }) {
+  const src = productImageSrc(product)
+  const [failedSrc, setFailedSrc] = useState('')
+  const [loadedSrc, setLoadedSrc] = useState('')
+  const isLoading = Boolean(src) && failedSrc !== src && loadedSrc !== src
+  if (!src || failedSrc === src) {
+    return <span className={className + ' product-image-placeholder'} aria-label="No product image"><Package size={20} /></span>
+  }
+  return (
+    <span className={className + ' product-image-frame'}>
+      {isLoading && <span className="product-image-loading" aria-hidden="true" />}
+      <img
+        className={className}
+        src={src}
+        alt={product?.name || product?.label ? (product.name || product.label) + ' product' : 'Product'}
+        loading="lazy"
+        decoding="async"
+        onLoad={() => setLoadedSrc(src)}
+        onError={() => setFailedSrc(src)}
+        style={{ opacity: loadedSrc === src ? 1 : 0 }}
+      />
+    </span>
+  )
+}
+
+function ProductImageUploader({ currentImageUrl = '', productName = 'Product', maxBytes, disabled = false }) {
+  const [file, setFile] = useState(null)
+  const [error, setError] = useState('')
+  const [remove, setRemove] = useState(false)
+  const [dragging, setDragging] = useState(false)
+  const inputRef = useRef(null)
+  const previewUrl = useMemo(() => file ? URL.createObjectURL(file) : '', [file])
+  useEffect(() => () => { if (previewUrl) URL.revokeObjectURL(previewUrl) }, [previewUrl])
+  function choose(next) {
+    if (!next) return
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(next.type)) {
+      setFile(null)
+      if (inputRef.current) inputRef.current.value = ''
+      setError('Choose a PNG, JPG, or WebP image.')
+      return
+    }
+    if (next.size > maxBytes) {
+      setFile(null)
+      if (inputRef.current) inputRef.current.value = ''
+      setError('This image exceeds the ' + Math.round(maxBytes / 1024 / 1024) + ' MB size limit.')
+      return
+    }
+    const transfer = new DataTransfer()
+    transfer.items.add(next)
+    if (inputRef.current) inputRef.current.files = transfer.files
+    setError(''); setRemove(false); setFile(next)
+  }
+  const hasCurrent = Boolean(currentImageUrl)
+  return <div className={'product-image-uploader' + (dragging ? ' is-dragging' : '')} onDragOver={(event) => { event.preventDefault(); setDragging(true) }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); choose(event.dataTransfer.files?.[0]) }}>
+    <input ref={inputRef} hidden type="file" name="productImage" accept="image/png,image/jpeg,image/webp" disabled={disabled} onChange={(event) => choose(event.target.files?.[0])} />
+    <div className="product-image-preview">{previewUrl ? <img src={previewUrl} alt={productName + ' preview'} /> : hasCurrent && !remove ? <img src={currentImageUrl} alt={productName + ' current image'} /> : <Package size={28} />}</div>
+    <div className="product-image-upload-copy"><strong>{file ? file.name : hasCurrent && !remove ? 'Current product image' : 'Product image (optional)'}</strong><span>PNG, JPG, or WebP ? up to {Math.round(maxBytes / 1024 / 1024)} MB</span>
+      <div className="product-image-upload-actions"><button type="button" className="text-action" disabled={disabled} onClick={() => { if (inputRef.current) inputRef.current.value = ''; setFile(null); inputRef.current?.click() }}>{file || (hasCurrent && !remove) ? 'Choose another image' : 'Choose image'}</button>{file && <button type="button" className="text-action" disabled={disabled} onClick={() => { setFile(null); if (inputRef.current) inputRef.current.value = '' }}>Clear selection</button>}{hasCurrent && <button type="button" className="text-action danger-action" disabled={disabled} onClick={() => { setRemove(!remove); setFile(null); if (inputRef.current) inputRef.current.value = ''; setError('') }}>{remove ? 'Undo remove' : 'Remove image'}</button>}</div>
+      {remove && <span className="image-remove-note">Image will be removed when you save.</span>}
+      {error && <span role="alert" className="image-upload-error">{error}</span>}
+    </div>
+    <input type="hidden" name="productImageError" value={error} />
+    <input type="hidden" name="removeProductImage" value={remove ? 'true' : 'false'} />
+  </div>
+}
+
+function Modal({ type, onClose, onAddProduct, onAddAgent, onAddExpense, onRestockProduct, restockProduct, product, maxProductImageBytes = 5 * 1024 * 1024, productImageBusy = false, onSaveProductImage, currencyCode = 'TZS' }) {
   const isProduct = type === 'product'
   const isSalesAgent = type === 'sales-agent'
   const isExpense = type === 'expense'
@@ -3963,10 +4680,16 @@ function Modal({ type, onClose, onAddProduct, onAddAgent, onAddExpense, onRestoc
     }}>
       <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <div className="modal-heading">
-          <div><p className="eyebrow">KAJUNA BMS</p><h2 id="modal-title">{title}</h2></div>
+          <div><p className="eyebrow">Business Management Portal</p><h2 id="modal-title">{title}</h2></div>
           <button type="button" className="modal-close" aria-label="Close dialog" onClick={onClose}>×</button>
         </div>
-        {type === 'restock' ? (
+        {type === 'product-image' ? (
+          <form className="modal-form" onSubmit={onSaveProductImage}>
+            <p className="form-copy">Update the image shown for {product?.name}. Product images are visible to your business users.</p>
+            <ProductImageUploader currentImageUrl={productImageSrc(product)} productName={product?.name} maxBytes={maxProductImageBytes} disabled={productImageBusy} />
+            <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose} disabled={productImageBusy}>Cancel</button><button type="submit" className="primary-button" disabled={productImageBusy}>{productImageBusy ? 'Saving?' : 'Save image'}</button></div>
+          </form>
+        ) : type === 'restock' ? (
           <form className="modal-form" onSubmit={onRestockProduct}>
             <div className="restock-product-summary">
               <strong>{restockProduct?.name}</strong>
@@ -3996,7 +4719,8 @@ function Modal({ type, onClose, onAddProduct, onAddAgent, onAddExpense, onRestoc
               <label>Stock quantity<input name="stock" type="number" min="0" step="1" required /></label>
               <p className="profit-hint">Gross profit per item is selling price minus buying price.</p>
             </div>
-            <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose}>Cancel</button><button type="submit" className="primary-button">Save product</button></div>
+            <ProductImageUploader maxBytes={maxProductImageBytes} disabled={productImageBusy} />
+            <div className="modal-actions"><button type="button" className="ghost-button" onClick={onClose} disabled={productImageBusy}>Cancel</button><button type="submit" className="primary-button" disabled={productImageBusy}>{productImageBusy ? 'Saving?' : 'Save product'}</button></div>
           </form>
         ) : isExpense ? (
           <form className="modal-form" onSubmit={onAddExpense}>

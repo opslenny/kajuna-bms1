@@ -11,6 +11,9 @@ export const pool = new Pool({
   max: Number(process.env.DATABASE_POOL_SIZE || 10),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
+  // Supabase's transaction pooler (PgBouncer) does not support server-side
+  // prepared statements, so disable pg's automatic statement preparation.
+  prepareThreshold: 0,
 })
 
 pool.on('error', (error) => {

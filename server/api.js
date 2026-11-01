@@ -5,6 +5,7 @@ import rateLimit from 'express-rate-limit'
 import { OAuth2Client } from 'google-auth-library'
 import { pool } from './db/pool.js'
 import { withDatabaseContext } from './db/transaction.js'
+import { readUserImage, removeStoredImage, storeUserImage } from './storage/images.js'
 import { hashPassword, verifyPassword } from './auth/password.js'
 import {
   convertCurrency,
@@ -21,7 +22,16 @@ const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}
 const dummyPasswordHash = 'scrypt$16384$00000000000000000000000000000000$' + '0'.repeat(128)
 const googleClient = new OAuth2Client()
 const paymentMethods = ['mobile_money', 'card', 'bank_transfer', 'cash', 'other']
-const maxBusinessLogoBytes = 5 * 1024 * 1024
+const configuredImageBytes = Number.parseInt(process.env.MAX_IMAGE_BYTES || '', 10)
+const maxImageBytes = Number.isSafeInteger(configuredImageBytes) && configuredImageBytes > 0
+  ? configuredImageBytes
+  : 5 * 1024 * 1024
+const maxBusinessLogoBytes = maxImageBytes
+const maxProfileImageBytes = maxImageBytes
+const configuredProductImageBytes = Number.parseInt(process.env.MAX_PRODUCT_IMAGE_BYTES || '', 10)
+const maxProductImageBytes = Number.isSafeInteger(configuredProductImageBytes) && configuredProductImageBytes > 0
+  ? configuredProductImageBytes
+  : maxImageBytes
 
 function detectBusinessLogoMimeType(image) {
   if (image.length >= 8
@@ -37,6 +47,15 @@ function detectBusinessLogoMimeType(image) {
     return 'image/webp'
   }
   return null
+}
+
+async function cleanupStoredImage(key) {
+  if (!key) return
+  try {
+    await removeStoredImage(key)
+  } catch (error) {
+    console.error('Unable to remove replaced image file:', error)
+  }
 }
 
 function addBillingPeriod(date, billingPeriod) {
@@ -129,6 +148,7 @@ function normalizeUser(row) {
     currency: row.currency || 'TZS',
     theme: row.theme || 'dark',
     language: row.language || 'en',
+    profileImageUpdatedAt: row.profile_image_updated_at || null,
   }
 }
 
@@ -249,6 +269,7 @@ async function authenticate(req, res, next) {
     const user = await withDatabaseContext(async (client) => {
       const { rows } = await client.query(
         `SELECT u.id, u.full_name, u.email, u.phone, u.role, u.status, u.business_id, u.theme, u.language,
+          u.profile_image_updated_at,
           b.name AS business_name, b.currency, b.status AS business_status
         FROM auth_sessions s
         JOIN users u ON u.id = s.user_id
@@ -364,6 +385,8 @@ function mapProduct(row) {
     reorderLevel: row.reorder_level,
     status: row.status,
     categoryId: row.category_id,
+    imageUrl: row.image_url || null,
+    imageUpdatedAt: row.product_image_updated_at || null,
   }
 }
 
@@ -437,7 +460,7 @@ api.get('/setup', asyncRoute(async (_req, res) => {
 }))
 
 api.get('/config', (_req, res) => {
-  res.json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null })
+  res.json({ googleClientId: process.env.GOOGLE_CLIENT_ID || null, maxProductImageBytes })
 })
 
 api.get('/currency-rates', asyncRoute(async (_req, res) => {
@@ -488,6 +511,7 @@ api.post('/auth/login', loginLimiter, asyncRoute(async (req, res) => {
   const result = await withDatabaseContext(async (client) => {
     const { rows } = await client.query(
       `SELECT u.id, u.full_name, u.email, u.phone, u.role, u.status, u.business_id, u.theme, u.language,
+        u.profile_image_updated_at,
         u.password_hash, b.name AS business_name, b.currency, b.status AS business_status
       FROM users u
       LEFT JOIN businesses b ON b.id = u.business_id
@@ -574,6 +598,7 @@ api.post('/auth/google', loginLimiter, asyncRoute(async (req, res) => {
     await lockGoogleIdentity(client, identity.sub)
     const { rows } = await client.query(
       `SELECT u.id, u.full_name, u.email, u.phone, u.role, u.status, u.business_id, u.theme, u.language,
+        u.profile_image_updated_at,
         u.google_sub, b.name AS business_name, b.currency, b.status AS business_status
       FROM users u
       LEFT JOIN businesses b ON b.id = u.business_id
@@ -617,6 +642,81 @@ api.get('/auth/me', (req, res) => {
   if (!readCookie(req, sessionCookie)) return res.json({ user: null })
   return authenticate(req, res, () => res.json({ user: req.user }))
 })
+
+api.get('/auth/profile-image', authenticate, asyncRoute(async (req, res) => {
+  const { rows } = await withDatabaseContext(
+    (client) => client.query(
+      `SELECT profile_image_storage_key, profile_image_mime_type
+      FROM users WHERE id = $1`,
+      [req.user.id],
+    ),
+    { platformAdmin: true },
+  )
+  const image = rows[0] && await readUserImage('users', req.user.id, rows[0].profile_image_storage_key)
+  if (!image) throw new HttpError(404, 'This account has no profile image.')
+  res.set({
+    'Content-Type': rows[0].profile_image_mime_type,
+    'Cache-Control': 'private, no-cache',
+    'X-Content-Type-Options': 'nosniff',
+  }).send(image)
+}))
+
+api.put('/auth/profile-image', authenticate,
+  express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: maxProfileImageBytes }),
+  asyncRoute(async (req, res) => {
+    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
+      throw new HttpError(400, 'Choose a PNG, JPEG, or WebP profile image to upload.')
+    }
+    const mimeType = detectBusinessLogoMimeType(req.body)
+    if (!mimeType || mimeType !== req.get('content-type')) {
+      throw new HttpError(400, 'The uploaded file must be a valid PNG, JPEG, or WebP image.')
+    }
+    const newKey = await storeUserImage('users', req.user.id, req.body, mimeType)
+    try {
+      const rows = await withDatabaseContext(async (client) => {
+        const { rows: updated } = await client.query(
+          `WITH prior AS (
+            SELECT profile_image_storage_key FROM users WHERE id = $3 FOR UPDATE
+          ), updated AS (
+            UPDATE users SET profile_image_storage_key = $1, profile_image_mime_type = $2,
+              profile_image_updated_at = now(), updated_at = now()
+            WHERE id = $3 AND status = 'active'
+            RETURNING profile_image_updated_at AS "profileImageUpdatedAt"
+          )
+          SELECT prior.profile_image_storage_key AS "oldStorageKey", updated."profileImageUpdatedAt"
+          FROM prior CROSS JOIN updated`,
+          [newKey, mimeType, req.user.id],
+        )
+        if (!updated[0]) throw new HttpError(401, 'Sign in to continue.')
+        return updated
+      }, { platformAdmin: true })
+      if (rows[0].oldStorageKey && rows[0].oldStorageKey !== newKey) await cleanupStoredImage(rows[0].oldStorageKey)
+      return res.json({ profileImageUpdatedAt: rows[0].profileImageUpdatedAt })
+    } catch (error) {
+      await removeStoredImage(newKey)
+      throw error
+    }
+  }),
+)
+
+api.delete('/auth/profile-image', authenticate, asyncRoute(async (req, res) => {
+  const rows = await withDatabaseContext(async (client) => {
+    const { rows: updated } = await client.query(
+      `WITH prior AS (SELECT profile_image_storage_key FROM users WHERE id = $1 FOR UPDATE),
+      updated AS (
+        UPDATE users SET profile_image_storage_key = NULL, profile_image_mime_type = NULL,
+          profile_image_updated_at = NULL, updated_at = now()
+        WHERE id = $1 RETURNING id
+      )
+      SELECT prior.profile_image_storage_key AS "oldStorageKey" FROM prior CROSS JOIN updated`,
+      [req.user.id],
+    )
+    if (!updated[0]) throw new HttpError(401, 'Sign in to continue.')
+    return updated
+  }, { platformAdmin: true })
+  if (rows[0].oldStorageKey) await cleanupStoredImage(rows[0].oldStorageKey)
+  res.status(204).end()
+}))
 
 api.patch('/auth/preferences', authenticate, asyncRoute(async (req, res) => {
   const body = requireObject(req.body)
@@ -1327,10 +1427,15 @@ api.patch('/platform/users/:id/password', authenticate, requireRole('platform_ad
 
 api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(async (req, res, client) => {
   const chartRange = req.query.range || 'today'
-  const chartDate = req.query.date || new Date().toISOString().slice(0, 10)
+  let chartDate = req.query.date
+  if (!chartDate) {
+    const { rows: timezoneRows } = await client.query('SELECT timezone FROM businesses WHERE id = $1', [req.user.businessId])
+    const businessTimezone = timezoneRows[0]?.timezone || 'UTC'
+    chartDate = new Intl.DateTimeFormat('en-CA', { timeZone: businessTimezone }).format(new Date())
+  }
   const customStartDate = req.query.startDate
   const customEndDate = req.query.endDate
-  if (!['today', 'day', 'week', 'month', '3months', 'year', 'lastMonth', '7days', '30days', '90days', 'custom'].includes(chartRange)) {
+  if (!['today', 'yesterday', 'day', 'week', 'thisWeek', 'lastWeek', 'month', 'thisMonth', 'lastMonth', '3months', 'quarter', 'thisQuarter', 'year', 'thisYear', '7days', '30days', '90days', 'custom'].includes(chartRange)) {
     throw new HttpError(400, 'Business performance range is invalid.')
   }
   if (typeof chartDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(chartDate)
@@ -1349,9 +1454,53 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       throw new HttpError(400, 'Custom dashboard range must be valid and no longer than 366 days.')
     }
   }
+  const { rows: businessRows } = await client.query(
+    `SELECT currency, timezone FROM businesses WHERE id = $1`,
+    [req.user.businessId],
+  )
+  if (!businessRows[0]) throw new HttpError(404, 'Business not found.')
+  const displayCurrency = businessRows[0].currency
+  const businessTimezone = businessRows[0].timezone
+  const addDays = (value, days) => {
+    const date = new Date(`${value}T00:00:00.000Z`)
+    date.setUTCDate(date.getUTCDate() + days)
+    return date.toISOString().slice(0, 10)
+  }
+  const firstDayOfMonth = (value) => `${value.slice(0, 7)}-01`
+  const addMonths = (value, months) => {
+    const date = new Date(`${value}T00:00:00.000Z`)
+    date.setUTCMonth(date.getUTCMonth() + months)
+    return date.toISOString().slice(0, 10)
+  }
+  let rangeStartDay = chartDate
+  let rangeEndDay = addDays(chartDate, 1)
+  switch (chartRange) {
+    case 'yesterday': rangeStartDay = addDays(chartDate, -1); rangeEndDay = chartDate; break
+    case 'week': case '7days': rangeStartDay = addDays(chartDate, -6); rangeEndDay = addDays(chartDate, 1); break
+    case 'thisWeek': { const d = new Date(`${chartDate}T00:00:00.000Z`); const diff = (d.getUTCDay() + 6) % 7; rangeStartDay = addDays(chartDate, -diff); rangeEndDay = addDays(rangeStartDay, 7); break }
+    case 'lastWeek': { const d = new Date(`${chartDate}T00:00:00.000Z`); const diff = (d.getUTCDay() + 6) % 7; const s = addDays(chartDate, -diff); rangeStartDay = addDays(s, -7); rangeEndDay = s; break }
+    case 'month': case 'thisMonth': rangeStartDay = firstDayOfMonth(chartDate); rangeEndDay = addMonths(rangeStartDay, 1); break
+    case 'lastMonth': { const first = firstDayOfMonth(chartDate); rangeStartDay = addMonths(first, -1); rangeEndDay = first; break }
+    case '3months': rangeStartDay = addMonths(firstDayOfMonth(chartDate), -2); rangeEndDay = addMonths(firstDayOfMonth(chartDate), 1); break
+    case 'quarter': case 'thisQuarter': { const d = new Date(`${chartDate}T00:00:00.000Z`); const qsm = Math.floor(d.getUTCMonth() / 3) * 3; const qs = new Date(Date.UTC(d.getUTCFullYear(), qsm, 1)); const qe = new Date(Date.UTC(d.getUTCFullYear(), qsm + 3, 1)); rangeStartDay = qs.toISOString().slice(0, 10); rangeEndDay = qe.toISOString().slice(0, 10); break }
+    case 'year': rangeStartDay = addMonths(firstDayOfMonth(chartDate), -11); rangeEndDay = addMonths(firstDayOfMonth(chartDate), 1); break
+    case 'thisYear': rangeStartDay = `${chartDate.slice(0, 4)}-01-01`; rangeEndDay = `${Number(chartDate.slice(0, 4)) + 1}-01-01`; break
+    case '90days': rangeStartDay = addDays(chartDate, -89); rangeEndDay = addDays(chartDate, 1); break
+    case '30days': rangeStartDay = addDays(chartDate, -29); rangeEndDay = addDays(chartDate, 1); break
+    case 'custom': rangeStartDay = customStartDate || chartDate; rangeEndDay = addDays(customEndDate || chartDate, 1); break
+    default: break
+  }
+  const spanDays = Math.max(1, Math.round((Date.parse(`${rangeEndDay}T00:00:00.000Z`) - Date.parse(`${rangeStartDay}T00:00:00.000Z`)) / 86400000))
+  const aggregation = spanDays <= 31 ? 'daily' : spanDays <= 180 ? 'weekly' : 'monthly'
+  const stepInterval = aggregation === 'daily' ? '1 day' : aggregation === 'weekly' ? '7 days' : '1 month'
+  const truncUnit = aggregation === 'monthly' ? 'month' : 'day'
+  const previousStartDay = addDays(rangeStartDay, -spanDays)
+  const previousEndDay = rangeStartDay
   const { rows: metricRows } = await client.query(
     `WITH tenant AS (
-      SELECT id, timezone, currency, timezone(timezone, now())::date AS local_day
+      SELECT id, timezone, currency, timezone(timezone, now())::date AS local_day,
+        $2::date AS range_start, $3::date AS range_end,
+        $4::date AS prev_start, $5::date AS prev_end
       FROM businesses WHERE id = $1
     ), amounts AS (
       SELECT 'todaySales' AS metric, s.currency, sum(s.total) AS amount,
@@ -1369,8 +1518,8 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       SELECT 'revenue', s.currency, sum(s.total), s.exchange_rates, bool_or(s.fx_rate_is_stale)
       FROM sales s CROSS JOIN tenant t
       WHERE s.business_id = t.id
-        AND s.created_at >= (date_trunc('month', t.local_day)::date::timestamp AT TIME ZONE t.timezone)
-        AND s.created_at < ((t.local_day + 1)::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at >= (t.range_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.range_end::timestamp AT TIME ZONE t.timezone)
         AND s.status = 'completed'
       GROUP BY s.currency, s.exchange_rates
       UNION ALL
@@ -1378,23 +1527,23 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       FROM sale_items si JOIN sales s ON s.business_id = si.business_id AND s.id = si.sale_id
       CROSS JOIN tenant t
       WHERE s.business_id = t.id
-        AND s.created_at >= (date_trunc('month', t.local_day)::date::timestamp AT TIME ZONE t.timezone)
-        AND s.created_at < ((t.local_day + 1)::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at >= (t.range_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.range_end::timestamp AT TIME ZONE t.timezone)
         AND s.status = 'completed'
       GROUP BY s.currency, s.exchange_rates
       UNION ALL
       SELECT 'expenses', e.currency, sum(e.amount), e.exchange_rates, bool_or(e.fx_rate_is_stale)
       FROM expenses e CROSS JOIN tenant t
       WHERE e.business_id = t.id
-        AND e.expense_date >= date_trunc('month', t.local_day)::date
-        AND e.expense_date <= t.local_day
+        AND e.expense_date >= t.range_start
+        AND e.expense_date < t.range_end
       GROUP BY e.currency, e.exchange_rates
       UNION ALL
       SELECT 'cashIncome', s.currency, sum(s.total), s.exchange_rates, bool_or(s.fx_rate_is_stale)
       FROM sales s CROSS JOIN tenant t
       WHERE s.business_id = t.id
-        AND s.created_at >= (date_trunc('month', t.local_day)::date::timestamp AT TIME ZONE t.timezone)
-        AND s.created_at < ((t.local_day + 1)::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at >= (t.range_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.range_end::timestamp AT TIME ZONE t.timezone)
         AND s.status = 'completed' AND s.payment_status = 'paid'
         AND NOT EXISTS (
           SELECT 1 FROM debt_transactions dt
@@ -1405,43 +1554,81 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       SELECT 'cashIncome', dp.currency, sum(dp.amount), dp.exchange_rates, bool_or(dp.fx_rate_is_stale)
       FROM debt_payments dp CROSS JOIN tenant t
       WHERE dp.business_id = t.id
-        AND dp.received_at >= (date_trunc('month', t.local_day)::date::timestamp AT TIME ZONE t.timezone)
-        AND dp.received_at < ((t.local_day + 1)::timestamp AT TIME ZONE t.timezone)
+        AND dp.received_at >= (t.range_start::timestamp AT TIME ZONE t.timezone)
+        AND dp.received_at < (t.range_end::timestamp AT TIME ZONE t.timezone)
+      GROUP BY dp.currency, dp.exchange_rates
+      UNION ALL
+      SELECT 'previousRevenue', s.currency, sum(s.total), s.exchange_rates, bool_or(s.fx_rate_is_stale)
+      FROM sales s CROSS JOIN tenant t
+      WHERE s.business_id = t.id
+        AND s.created_at >= (t.prev_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.prev_end::timestamp AT TIME ZONE t.timezone)
+        AND s.status = 'completed'
+      GROUP BY s.currency, s.exchange_rates
+      UNION ALL
+      SELECT 'previousProfit', s.currency, sum(si.gross_profit), s.exchange_rates, bool_or(s.fx_rate_is_stale)
+      FROM sale_items si JOIN sales s ON s.business_id = si.business_id AND s.id = si.sale_id
+      CROSS JOIN tenant t
+      WHERE s.business_id = t.id
+        AND s.created_at >= (t.prev_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.prev_end::timestamp AT TIME ZONE t.timezone)
+        AND s.status = 'completed'
+      GROUP BY s.currency, s.exchange_rates
+      UNION ALL
+      SELECT 'previousExpenses', e.currency, sum(e.amount), e.exchange_rates, bool_or(e.fx_rate_is_stale)
+      FROM expenses e CROSS JOIN tenant t
+      WHERE e.business_id = t.id
+        AND e.expense_date >= t.prev_start
+        AND e.expense_date < t.prev_end
+      GROUP BY e.currency, e.exchange_rates
+      UNION ALL
+      SELECT 'previousCashIncome', s.currency, sum(s.total), s.exchange_rates, bool_or(s.fx_rate_is_stale)
+      FROM sales s CROSS JOIN tenant t
+      WHERE s.business_id = t.id
+        AND s.created_at >= (t.prev_start::timestamp AT TIME ZONE t.timezone)
+        AND s.created_at < (t.prev_end::timestamp AT TIME ZONE t.timezone)
+        AND s.status = 'completed' AND s.payment_status = 'paid'
+        AND NOT EXISTS (
+          SELECT 1 FROM debt_transactions dt
+          WHERE dt.business_id = s.business_id AND dt.sale_id = s.id
+        )
+      GROUP BY s.currency, s.exchange_rates
+      UNION ALL
+      SELECT 'previousCashIncome', dp.currency, sum(dp.amount), dp.exchange_rates, bool_or(dp.fx_rate_is_stale)
+      FROM debt_payments dp CROSS JOIN tenant t
+      WHERE dp.business_id = t.id
+        AND dp.received_at >= (t.prev_start::timestamp AT TIME ZONE t.timezone)
+        AND dp.received_at < (t.prev_end::timestamp AT TIME ZONE t.timezone)
       GROUP BY dp.currency, dp.exchange_rates
     )
     SELECT metric, currency, amount, exchange_rates, rates_stale FROM amounts`,
-    [req.user.businessId],
+    [req.user.businessId, rangeStartDay, rangeEndDay, previousStartDay, previousEndDay],
   )
-  const { rows: businessRows } = await client.query(
-    `SELECT currency, timezone(timezone, now())::date AS local_day FROM businesses WHERE id = $1`,
-    [req.user.businessId],
-  )
-  if (!businessRows[0]) throw new HttpError(404, 'Business not found.')
-  const displayCurrency = businessRows[0].currency
   const metrics = { todaySales: 0, todayExpenses: 0, revenue: 0, profit: 0, expenses: 0 }
+  const previousMetrics = { revenue: 0, profit: 0, expenses: 0 }
   let cashIncome = 0
+  let previousCashIncome = 0
   const fxWarnings = new Set()
   for (const row of metricRows) {
     const amount = convertRecordedAmount(row.amount, row.currency, displayCurrency, row.exchange_rates)
     if (row.metric === 'cashIncome') cashIncome += amount
+    else if (row.metric === 'previousCashIncome') previousCashIncome += amount
+    else if (row.metric.startsWith('previous')) previousMetrics[row.metric.slice('previous'.length).toLowerCase()] += amount
     else metrics[row.metric] += amount
     if (row.rates_stale) fxWarnings.add('One or more transactions were recorded with an outdated exchange-rate snapshot.')
   }
   metrics.netProfit = metrics.profit - metrics.expenses
   metrics.cashFlow = cashIncome - metrics.expenses
+  previousMetrics.netProfit = previousMetrics.profit - previousMetrics.expenses
+  previousMetrics.cashFlow = previousCashIncome - previousMetrics.expenses
   const { rows: productsSoldRows } = await client.query(
-    `WITH tenant AS (
-      SELECT id, timezone, timezone(timezone, now())::date AS local_day
-      FROM businesses WHERE id = $1
-    )
-    SELECT coalesce(sum(si.quantity), 0)::integer AS products_sold
+    `SELECT coalesce(sum(si.quantity), 0)::integer AS products_sold
     FROM sale_items si JOIN sales s ON s.business_id = si.business_id AND s.id = si.sale_id
-    CROSS JOIN tenant t
-    WHERE s.business_id = t.id
-      AND s.created_at >= (date_trunc('month', t.local_day)::date::timestamp AT TIME ZONE t.timezone)
-      AND s.created_at < ((t.local_day + 1)::timestamp AT TIME ZONE t.timezone)
+    WHERE s.business_id = $1
+      AND s.created_at >= ($2::timestamp AT TIME ZONE $3)
+      AND s.created_at < ($4::timestamp AT TIME ZONE $3)
       AND s.status = 'completed'`,
-    [req.user.businessId],
+    [req.user.businessId, rangeStartDay, businessTimezone, rangeEndDay],
   )
   const { rows: inventoryRows } = await client.query(
     `SELECT count(*) FILTER (WHERE status = 'active')::integer AS product_count,
@@ -1463,34 +1650,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
     `WITH tenant AS (
       SELECT id, timezone, currency FROM businesses WHERE id = $1
     ), bounds AS (
-      SELECT
-        CASE $2
-          WHEN 'today' THEN $3::date
-          WHEN 'day' THEN $3::date
-          WHEN 'week' THEN $3::date - 6
-          WHEN '7days' THEN $3::date - 6
-          WHEN '30days' THEN $3::date - 29
-          WHEN '90days' THEN $3::date - 89
-          WHEN 'custom' THEN $4::date
-          WHEN 'month' THEN date_trunc('month', $3::date)::date
-          WHEN '3months' THEN date_trunc('month', $3::date - interval '2 months')::date
-          WHEN 'year' THEN date_trunc('month', $3::date - interval '11 months')::date
-          WHEN 'lastMonth' THEN date_trunc('month', $3::date - interval '1 month')::date
-        END AS start_day,
-        CASE $2
-          WHEN 'today' THEN $3::date + 1
-          WHEN 'day' THEN $3::date + 1
-          WHEN 'week' THEN $3::date + 1
-          WHEN '7days' THEN $3::date + 1
-          WHEN '30days' THEN $3::date + 1
-          WHEN '90days' THEN $3::date + 1
-          WHEN 'custom' THEN $5::date + 1
-          WHEN 'month' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN '3months' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN 'year' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN 'lastMonth' THEN date_trunc('month', $3::date)::date
-        END AS end_day,
-        CASE WHEN $2 = 'year' THEN interval '1 month' ELSE interval '1 day' END AS step,
+      SELECT $2::date AS start_day, $3::date AS end_day, $4::interval AS step,
         tenant.id AS business_id, tenant.timezone
       FROM tenant
     ), buckets AS (
@@ -1502,7 +1662,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
         bounds.step
       ) AS bucket
     ), financial_by_bucket AS (
-      SELECT date_trunc(CASE WHEN $2 = 'year' THEN 'month' ELSE 'day' END, timezone(bounds.timezone, s.created_at))::date AS bucket,
+      SELECT date_trunc($5, timezone(bounds.timezone, s.created_at))::date AS bucket,
         'revenue'::text AS metric, s.currency, sum(s.total) AS amount,
         s.exchange_rates, bool_or(s.fx_rate_is_stale) AS rates_stale
       FROM sales s CROSS JOIN bounds
@@ -1511,7 +1671,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
         AND s.created_at < (bounds.end_day::timestamp AT TIME ZONE bounds.timezone)
       GROUP BY 1, s.currency, s.exchange_rates
       UNION ALL
-      SELECT date_trunc(CASE WHEN $2 = 'year' THEN 'month' ELSE 'day' END, timezone(bounds.timezone, s.created_at))::date,
+      SELECT date_trunc($5, timezone(bounds.timezone, s.created_at))::date,
         'profit', s.currency, sum(si.gross_profit), s.exchange_rates, bool_or(s.fx_rate_is_stale)
       FROM sales s
       JOIN sale_items si ON si.business_id = s.business_id AND si.sale_id = s.id
@@ -1521,7 +1681,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
         AND s.created_at < (bounds.end_day::timestamp AT TIME ZONE bounds.timezone)
       GROUP BY 1, s.currency, s.exchange_rates
       UNION ALL
-      SELECT date_trunc(CASE WHEN $2 = 'year' THEN 'month' ELSE 'day' END, e.expense_date)::date,
+      SELECT date_trunc($5, e.expense_date)::date,
         'expenses', e.currency, sum(e.amount), e.exchange_rates, bool_or(e.fx_rate_is_stale)
       FROM expenses e CROSS JOIN bounds
       WHERE e.business_id = bounds.business_id
@@ -1529,7 +1689,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       GROUP BY 1, e.currency, e.exchange_rates
     )
     SELECT buckets.bucket,
-      CASE WHEN $2 = 'year' THEN to_char(buckets.bucket, 'Mon YYYY') ELSE to_char(buckets.bucket, 'Mon DD') END AS label,
+      CASE WHEN $5 = 'month' THEN to_char(buckets.bucket, 'Mon YYYY') ELSE to_char(buckets.bucket, 'Mon DD') END AS label,
       financial_by_bucket.metric,
       financial_by_bucket.currency,
       financial_by_bucket.amount,
@@ -1538,7 +1698,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
     FROM buckets
     LEFT JOIN financial_by_bucket ON financial_by_bucket.bucket = buckets.bucket
     ORDER BY buckets.bucket, financial_by_bucket.metric, financial_by_bucket.currency`,
-    [req.user.businessId, chartRange, chartDate, customStartDate || chartDate, customEndDate || chartDate],
+    [req.user.businessId, rangeStartDay, rangeEndDay, stepInterval, truncUnit],
   )
   const chartByDay = new Map()
   for (const row of chartRows) {
@@ -1565,29 +1725,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
     `WITH tenant AS (
       SELECT id FROM businesses WHERE id = $1
     ), bounds AS (
-      SELECT
-        CASE $2
-          WHEN 'today' THEN $3::date
-          WHEN 'day' THEN $3::date
-          WHEN 'week' THEN $3::date - 6
-          WHEN '7days' THEN $3::date - 6
-          WHEN '30days' THEN $3::date - 29
-          WHEN '90days' THEN $3::date - 89
-          WHEN 'month' THEN date_trunc('month', $3::date)::date
-          WHEN '3months' THEN date_trunc('month', $3::date - interval '2 months')::date
-          WHEN 'year' THEN date_trunc('month', $3::date - interval '11 months')::date
-          WHEN 'lastMonth' THEN date_trunc('month', $3::date - interval '1 month')::date
-          WHEN 'custom' THEN $4::date
-        END AS start_day,
-        CASE $2
-          WHEN 'month' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN '3months' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN 'year' THEN date_trunc('month', $3::date + interval '1 month')::date
-          WHEN 'lastMonth' THEN date_trunc('month', $3::date)::date
-          WHEN 'custom' THEN $5::date + 1
-          ELSE $3::date + 1
-        END AS end_day,
-        tenant.id AS business_id
+      SELECT $2::date AS start_day, $3::date AS end_day, tenant.id AS business_id
       FROM tenant
     )
     SELECT e.category, e.currency, sum(e.amount) AS amount, e.exchange_rates, bool_or(e.fx_rate_is_stale) AS rates_stale
@@ -1595,7 +1733,7 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
     WHERE e.business_id = bounds.business_id
       AND e.expense_date >= bounds.start_day AND e.expense_date < bounds.end_day
     GROUP BY e.category, e.currency, e.exchange_rates ORDER BY e.category`,
-    [req.user.businessId, chartRange, chartDate, customStartDate || chartDate, customEndDate || chartDate],
+    [req.user.businessId, rangeStartDay, rangeEndDay],
   )
   const expenseCategoryMap = new Map()
   for (const row of expenseCategoryRows) {
@@ -1662,6 +1800,10 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
       lowStock: inventoryRows[0].low_stock,
       productCount: inventoryRows[0].product_count,
     },
+    previousPeriod: {
+      ...previousMetrics,
+      comparison: 'previous month to date',
+    },
     chart: [...chartByDay.values()],
     expenseBreakdown,
     recentTransactions,
@@ -1684,6 +1826,219 @@ api.get('/dashboard', authenticate, requireRole('business_admin'), tenantRoute(a
   })
 }))
 
+api.get(['/reports/monthly', '/reports/custom'], authenticate, requireRole('business_admin'), tenantRoute(async (req, res, client) => {
+  const isCustom = !!(req.query.startDate || req.query.endDate)
+  let month = null
+  let year = null
+  let startDay
+  let endDay
+  if (isCustom) {
+    const isDate = (value) => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)
+    if (!isDate(req.query.startDate) || !isDate(req.query.endDate) || req.query.startDate > req.query.endDate) {
+      throw new HttpError(400, 'Custom report date range is invalid.')
+    }
+    startDay = req.query.startDate
+    const endDate = new Date(`${req.query.endDate}T00:00:00.000Z`)
+    endDate.setUTCDate(endDate.getUTCDate() + 1)
+    endDay = endDate.toISOString().slice(0, 10)
+  } else {
+    month = Number(req.query.month)
+    year = Number(req.query.year)
+    if (!Number.isInteger(month) || month < 1 || month > 12) throw new HttpError(400, 'Reporting month is invalid.')
+    if (!Number.isInteger(year) || year < 2000 || year > 2100) throw new HttpError(400, 'Reporting year is invalid.')
+    startDay = `${year}-${String(month).padStart(2, '0')}-01`
+    const endMonth = month === 12 ? 1 : month + 1
+    const endYear = month === 12 ? year + 1 : year
+    endDay = `${endYear}-${String(endMonth).padStart(2, '0')}-01`
+  }
+  const { rows: bizRows } = await client.query('SELECT name, currency, timezone FROM businesses WHERE id = $1', [req.user.businessId])
+  if (!bizRows[0]) throw new HttpError(404, 'Business not found.')
+  const business = bizRows[0]
+  const tz = business.timezone
+  const displayCurrency = business.currency
+
+  const { rows: saleRows } = await client.query(
+    `SELECT s.id, s.total, s.currency, s.exchange_rates, s.payment_method, s.payment_status, s.status,
+       s.created_at,
+       coalesce((SELECT sum(si.gross_profit) FROM sale_items si WHERE si.business_id = s.business_id AND si.sale_id = s.id), 0) AS profit
+     FROM sales s
+     WHERE s.business_id = $1
+       AND s.created_at >= ($2::timestamp AT TIME ZONE $3)
+       AND s.created_at < ($4::timestamp AT TIME ZONE $3)`,
+    [req.user.businessId, startDay, tz, endDay],
+  )
+
+  const { rows: expenseRows } = await client.query(
+    `SELECT category, amount, currency, exchange_rates, expense_date
+     FROM expenses
+     WHERE business_id = $1 AND expense_date >= $2::date AND expense_date < $3::date`,
+    [req.user.businessId, startDay, endDay],
+  )
+
+  const { rows: debtPaymentRows } = await client.query(
+    `SELECT amount, currency, exchange_rates, received_at
+     FROM debt_payments
+     WHERE business_id = $1
+       AND received_at >= ($2::timestamp AT TIME ZONE $3)
+       AND received_at < ($4::timestamp AT TIME ZONE $3)`,
+    [req.user.businessId, startDay, tz, endDay],
+  )
+
+  const { rows: debtSaleRows } = await client.query(
+    `SELECT sale_id FROM debt_transactions WHERE business_id = $1`,
+    [req.user.businessId],
+  )
+  const debtSaleIds = new Set(debtSaleRows.map((r) => r.sale_id))
+
+  const convert = (amount, currency, rates) => convertRecordedAmount(amount, currency, displayCurrency, rates)
+
+  let totalRevenue = 0
+  let totalProfitGross = 0
+  let salesCount = 0
+  let refundedAmount = 0
+  let refundedCount = 0
+  let voidedCount = 0
+  const paymentMethods = new Map()
+  for (const row of saleRows) {
+    const amount = convert(row.total, row.currency, row.exchange_rates)
+    if (row.status === 'completed') {
+      totalRevenue += amount
+      totalProfitGross += Number(convert(row.profit, row.currency, row.exchange_rates))
+      salesCount += 1
+      const method = row.payment_method || 'other'
+      const current = paymentMethods.get(method) || { count: 0, amount: 0 }
+      current.count += 1
+      current.amount += amount
+      paymentMethods.set(method, current)
+    } else if (row.status === 'refunded') {
+      refundedCount += 1
+      refundedAmount += amount
+    } else if (row.status === 'voided') {
+      voidedCount += 1
+    }
+  }
+
+  let totalExpenses = 0
+  const expenseByCategory = new Map()
+  for (const row of expenseRows) {
+    const amount = convert(row.amount, row.currency, row.exchange_rates)
+    totalExpenses += amount
+    const current = expenseByCategory.get(row.category) || { amount: 0, count: 0 }
+    current.amount += amount
+    current.count += 1
+    expenseByCategory.set(row.category, current)
+  }
+
+  let cashIncome = 0
+  for (const row of saleRows) {
+    if (row.status !== 'completed' || row.payment_status !== 'paid') continue
+    if (debtSaleIds.has(row.id)) continue
+    cashIncome += convert(row.total, row.currency, row.exchange_rates)
+  }
+  for (const row of debtPaymentRows) {
+    cashIncome += convert(row.amount, row.currency, row.exchange_rates)
+  }
+
+  const netProfit = totalProfitGross - totalExpenses
+  const cashFlow = cashIncome - totalExpenses
+  const profitMargin = totalRevenue > 0 ? (netProfit / totalRevenue) * 100 : 0
+
+  let prevStart
+  let prevEnd
+  if (isCustom) {
+    const span = Math.round((Date.parse(`${endDay}T00:00:00.000Z`) - Date.parse(`${startDay}T00:00:00.000Z`)) / 86400000)
+    const ps = new Date(`${startDay}T00:00:00.000Z`)
+    ps.setUTCDate(ps.getUTCDate() - span)
+    prevStart = ps.toISOString().slice(0, 10)
+    prevEnd = startDay
+  } else {
+    const prevMonth = month === 1 ? 12 : month - 1
+    const prevYear = month === 1 ? year - 1 : year
+    prevStart = `${prevYear}-${String(prevMonth).padStart(2, '0')}-01`
+    const prevEndMonth = prevMonth === 12 ? 1 : prevMonth + 1
+    const prevEndYear = prevMonth === 12 ? prevYear + 1 : prevYear
+    prevEnd = `${prevEndYear}-${String(prevEndMonth).padStart(2, '0')}-01`
+  }
+
+  const { rows: prevSaleRows } = await client.query(
+    `SELECT s.total, s.currency, s.exchange_rates, s.status,
+       coalesce((SELECT sum(si.gross_profit) FROM sale_items si WHERE si.business_id = s.business_id AND si.sale_id = s.id), 0) AS profit
+     FROM sales s
+     WHERE s.business_id = $1
+       AND s.created_at >= ($2::timestamp AT TIME ZONE $3)
+       AND s.created_at < ($4::timestamp AT TIME ZONE $3)`,
+    [req.user.businessId, prevStart, tz, prevEnd],
+  )
+  const { rows: prevExpenseRows } = await client.query(
+    `SELECT amount, currency, exchange_rates FROM expenses
+     WHERE business_id = $1 AND expense_date >= $2::date AND expense_date < $3::date`,
+    [req.user.businessId, prevStart, prevEnd],
+  )
+  let prevRevenue = 0, prevProfitGross = 0, prevExpenses = 0
+  for (const row of prevSaleRows) {
+    if (row.status !== 'completed') continue
+    prevRevenue += convert(row.total, row.currency, row.exchange_rates)
+    prevProfitGross += Number(convert(row.profit, row.currency, row.exchange_rates))
+  }
+  for (const row of prevExpenseRows) {
+    prevExpenses += convert(row.amount, row.currency, row.exchange_rates)
+  }
+  const prevNetProfit = prevProfitGross - prevExpenses
+
+  const daily = []
+  const cursor = new Date(`${startDay}T00:00:00.000Z`)
+  const last = new Date(`${endDay}T00:00:00.000Z`)
+  last.setUTCDate(last.getUTCDate() - 1)
+  while (cursor <= last) {
+    daily.push({ date: cursor.toISOString().slice(0, 10), revenue: 0, expenses: 0 })
+    cursor.setUTCDate(cursor.getUTCDate() + 1)
+  }
+  for (const row of saleRows) {
+    if (row.status !== 'completed') continue
+    const ds = new Date(row.created_at).toISOString().slice(0, 10)
+    const idx = daily.findIndex((d) => d.date === ds)
+    if (idx >= 0) daily[idx].revenue += convert(row.total, row.currency, row.exchange_rates)
+  }
+  for (const row of expenseRows) {
+    const eds = row.expense_date instanceof Date ? row.expense_date.toISOString().slice(0, 10) : String(row.expense_date)
+    const idx = daily.findIndex((d) => d.date === eds)
+    if (idx >= 0) daily[idx].expenses += convert(row.amount, row.currency, row.exchange_rates)
+  }
+
+  res.json({
+    business: { name: business.name, currency: displayCurrency },
+    period: { month, year, startDay, endDay },
+    summary: {
+      totalRevenue,
+      totalExpenses,
+      netProfit,
+      cash: cashFlow,
+      cashIncome,
+      profitMargin,
+      salesCount,
+      refundedAmount,
+      refundedCount,
+      voidedCount,
+    },
+    expenseBreakdown: [...expenseByCategory].map(([category, value]) => ({
+      category,
+      amount: value.amount,
+      count: value.count,
+      percentage: totalExpenses > 0 ? value.amount / totalExpenses * 100 : 0,
+    })),
+    paymentMethods: [...paymentMethods].map(([method, value]) => ({
+      method,
+      count: value.count,
+      amount: value.amount,
+    })),
+    comparison: {
+      previousRevenue: prevRevenue,
+      previousExpenses: prevExpenses,
+      previousNetProfit: prevNetProfit,
+    },
+    daily,
+  })
+}))
 api.get('/business', authenticate, tenantRoute(async (req, res, client) => {
   const { rows } = await client.query(
     `SELECT id, name, email, phone, industry, currency, timezone, status,
@@ -1698,18 +2053,23 @@ api.get('/business', authenticate, tenantRoute(async (req, res, client) => {
 api.get('/business/logo', authenticate, asyncRoute(async (req, res) => {
   const result = await withDatabaseContext(
     (client) => client.query(
-      `SELECT logo_data, logo_mime_type FROM businesses WHERE id = $1`,
+      `SELECT logo_data, logo_mime_type, logo_storage_key, logo_storage_mime_type
+      FROM businesses WHERE id = $1`,
       [req.user.businessId],
     ),
     { businessId: req.user.businessId },
   )
   if (!result.rows[0]) throw new HttpError(404, 'Business not found.')
-  if (!result.rows[0].logo_data) throw new HttpError(404, 'This business has no logo.')
+  const storedImage = result.rows[0].logo_storage_key
+    ? await readUserImage('businesses', req.user.businessId, result.rows[0].logo_storage_key)
+    : null
+  const image = storedImage || result.rows[0].logo_data
+  if (!image) throw new HttpError(404, 'This business has no logo.')
   res.set({
-    'Content-Type': result.rows[0].logo_mime_type,
+    'Content-Type': storedImage ? result.rows[0].logo_storage_mime_type : result.rows[0].logo_mime_type,
     'Cache-Control': 'private, no-cache',
     'X-Content-Type-Options': 'nosniff',
-  }).send(result.rows[0].logo_data)
+  }).send(image)
 }))
 
 api.put(
@@ -1717,7 +2077,7 @@ api.put(
   authenticate,
   requireRole('business_admin'),
   express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: maxBusinessLogoBytes }),
-  tenantRoute(async (req, res, client) => {
+  asyncRoute(async (req, res) => {
     if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
       throw new HttpError(400, 'Choose a PNG, JPEG, or WebP logo to upload.')
     }
@@ -1725,37 +2085,57 @@ api.put(
     if (!detectedMimeType || detectedMimeType !== req.get('content-type')) {
       throw new HttpError(400, 'The uploaded file must be a valid PNG, JPEG, or WebP image.')
     }
-    const { rows } = await client.query(
-      `UPDATE businesses
-      SET logo_data = $1, logo_mime_type = $2, logo_updated_at = now(), updated_at = now()
-      WHERE id = $3
-      RETURNING logo_updated_at AS "logoUpdatedAt"`,
-      [req.body, detectedMimeType, req.user.businessId],
-    )
-    if (!rows[0]) throw new HttpError(404, 'Business not found.')
-    await client.query(
-      `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details)
-      VALUES ($1, $2, 'business_logo_updated', 'business', $1, $3::jsonb)`,
-      [req.user.businessId, req.user.id, JSON.stringify({ mimeType: detectedMimeType, sizeBytes: req.body.length })],
-    )
-    res.json({ logoUpdatedAt: rows[0].logoUpdatedAt })
+    const newKey = await storeUserImage('businesses', req.user.businessId, req.body, detectedMimeType)
+    try {
+      const rows = await withDatabaseContext(async (client) => {
+        const { rows: updated } = await client.query(
+          `WITH prior AS (SELECT logo_storage_key FROM businesses WHERE id = $3 FOR UPDATE), updated AS (
+            UPDATE businesses SET logo_data = NULL, logo_mime_type = NULL,
+              logo_storage_key = $1, logo_storage_mime_type = $2, logo_updated_at = now(), updated_at = now()
+            WHERE id = $3
+            RETURNING logo_updated_at AS "logoUpdatedAt"
+          )
+          SELECT prior.logo_storage_key AS "oldStorageKey", updated."logoUpdatedAt"
+          FROM prior CROSS JOIN updated`,
+          [newKey, detectedMimeType, req.user.businessId],
+        )
+        if (!updated[0]) throw new HttpError(404, 'Business not found.')
+        await client.query(
+          `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details)
+          VALUES ($1, $2, 'business_logo_updated', 'business', $1, $3::jsonb)`,
+          [req.user.businessId, req.user.id, JSON.stringify({ mimeType: detectedMimeType, sizeBytes: req.body.length })],
+        )
+        return updated
+      }, { businessId: req.user.businessId })
+      if (rows[0].oldStorageKey && rows[0].oldStorageKey !== newKey) await cleanupStoredImage(rows[0].oldStorageKey)
+      return res.json({ logoUpdatedAt: rows[0].logoUpdatedAt })
+    } catch (error) {
+      await removeStoredImage(newKey)
+      throw error
+    }
   }),
 )
 
-api.delete('/business/logo', authenticate, requireRole('business_admin'), tenantRoute(async (req, res, client) => {
-  const { rows } = await client.query(
-    `UPDATE businesses
-    SET logo_data = NULL, logo_mime_type = NULL, logo_updated_at = NULL, updated_at = now()
-    WHERE id = $1
-    RETURNING id`,
-    [req.user.businessId],
-  )
-  if (!rows[0]) throw new HttpError(404, 'Business not found.')
-  await client.query(
-    `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id)
-    VALUES ($1, $2, 'business_logo_removed', 'business', $1)`,
-    [req.user.businessId, req.user.id],
-  )
+api.delete('/business/logo', authenticate, requireRole('business_admin'), asyncRoute(async (req, res) => {
+  const rows = await withDatabaseContext(async (client) => {
+    const { rows: updated } = await client.query(
+      `WITH prior AS (SELECT logo_storage_key FROM businesses WHERE id = $1 FOR UPDATE), updated AS (
+        UPDATE businesses SET logo_data = NULL, logo_mime_type = NULL, logo_storage_key = NULL,
+          logo_storage_mime_type = NULL, logo_updated_at = NULL, updated_at = now()
+        WHERE id = $1 RETURNING id
+      )
+      SELECT prior.logo_storage_key AS "oldStorageKey", updated.id FROM prior CROSS JOIN updated`,
+      [req.user.businessId],
+    )
+    if (!updated[0]) throw new HttpError(404, 'Business not found.')
+    await client.query(
+      `INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id)
+      VALUES ($1, $2, 'business_logo_removed', 'business', $1)`,
+      [req.user.businessId, req.user.id],
+    )
+    return updated
+  }, { businessId: req.user.businessId })
+  if (rows[0].oldStorageKey) await cleanupStoredImage(rows[0].oldStorageKey)
   res.status(204).end()
 }))
 
@@ -1872,7 +2252,7 @@ api.get('/products', authenticate, tenantRoute(async (_req, res, client) => {
   if (!businesses[0]) throw new HttpError(404, 'Business not found.')
   const displayCurrency = businesses[0].currency
   const { rows } = await client.query(
-    `SELECT id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency
+    `SELECT id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency, image_url, product_image_updated_at
     FROM products WHERE business_id = $1 AND status = 'active' ORDER BY name`,
     [_req.user.businessId],
   )
@@ -1905,7 +2285,7 @@ api.post('/products', authenticate, requireRole('business_admin'), tenantRoute(a
   const { rows } = await client.query(
     `INSERT INTO products (business_id, category_id, name, sku, buying_price, selling_price, quantity, reorder_level, currency)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency`,
+    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency, image_url, product_image_updated_at`,
     [req.user.businessId, categoryId, name, sku, buyingPrice, sellingPrice, quantity, reorderLevel, businesses[0].currency],
   )
   if (quantity > 0) {
@@ -1956,10 +2336,51 @@ api.patch('/products/:id', authenticate, requireRole('business_admin'), tenantRo
   const idParameter = updateValues.length + 1
   const { rows } = await client.query(
     `UPDATE products SET ${updates.join(', ')}, updated_at = now() WHERE id = $${idParameter}
-    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency`,
+    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency, image_url, product_image_updated_at`,
     [...updateValues, id],
   )
   res.json({ product: mapProduct(rows[0]) })
+}))
+
+api.get('/products/:id/image', authenticate, asyncRoute(async (req, res) => {
+  const id = requireUuid(req.params.id, 'Product ID')
+  const { rows } = await withDatabaseContext(
+    (client) => client.query('SELECT product_image_storage_key, product_image_mime_type, product_image_data FROM products WHERE id = $1 AND business_id = $2', [id, req.user.businessId]),
+    { businessId: req.user.businessId },
+  )
+  if (!rows[0]) throw new HttpError(404, 'Product not found.')
+  const image = rows[0].product_image_data || await readUserImage('products', id, rows[0].product_image_storage_key)
+  if (!image) throw new HttpError(404, 'This product has no image.')
+  res.set({ 'Content-Type': rows[0].product_image_mime_type, 'Cache-Control': 'private, no-cache', 'X-Content-Type-Options': 'nosniff' }).send(image)
+}))
+
+api.put('/products/:id/image', authenticate, requireRole('business_admin'), express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: maxProductImageBytes }), asyncRoute(async (req, res) => {
+  const id = requireUuid(req.params.id, 'Product ID')
+  if (!Buffer.isBuffer(req.body) || req.body.length === 0) throw new HttpError(400, 'Choose a PNG, JPEG, or WebP product image to upload.')
+  const mimeType = detectBusinessLogoMimeType(req.body)
+  if (!mimeType || mimeType !== req.get('content-type')) throw new HttpError(400, 'The uploaded file must be a valid PNG, JPEG, or WebP image.')
+  const rows = await withDatabaseContext(async (client) => {
+    const { rows: prior } = await client.query('SELECT product_image_storage_key FROM products WHERE id = $1 AND business_id = $2 FOR UPDATE', [id, req.user.businessId])
+    if (!prior[0]) throw new HttpError(404, 'Product not found.')
+    const { rows: updated } = await client.query("UPDATE products SET product_image_storage_key = NULL, product_image_data = $1, product_image_mime_type = $2, product_image_updated_at = now(), image_url = NULL, updated_at = now() WHERE id = $3 AND business_id = $4 RETURNING product_image_updated_at AS image_updated_at", [req.body, mimeType, id, req.user.businessId])
+    await client.query("INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id, details) VALUES ($1, $2, 'product_image_updated', 'product', $3, $4::jsonb)", [req.user.businessId, req.user.id, id, JSON.stringify({ mimeType, sizeBytes: req.body.length })])
+    return [{ oldStorageKey: prior[0].product_image_storage_key, imageUpdatedAt: updated[0].image_updated_at }]
+  }, { businessId: req.user.businessId })
+  if (rows[0].oldStorageKey) await cleanupStoredImage(rows[0].oldStorageKey)
+  return res.json({ imageUpdatedAt: rows[0].imageUpdatedAt })
+}))
+
+api.delete('/products/:id/image', authenticate, requireRole('business_admin'), asyncRoute(async (req, res) => {
+  const id = requireUuid(req.params.id, 'Product ID')
+  const rows = await withDatabaseContext(async (client) => {
+    const { rows: prior } = await client.query('SELECT product_image_storage_key FROM products WHERE id = $1 AND business_id = $2 FOR UPDATE', [id, req.user.businessId])
+    if (!prior[0]) throw new HttpError(404, 'Product not found.')
+    await client.query("UPDATE products SET product_image_storage_key = NULL, product_image_data = NULL, product_image_mime_type = NULL, product_image_updated_at = NULL, image_url = NULL, updated_at = now() WHERE id = $1 AND business_id = $2", [id, req.user.businessId])
+    if (prior[0].product_image_storage_key) await client.query("INSERT INTO audit_logs (business_id, actor_user_id, action, entity_type, entity_id) VALUES ($1, $2, 'product_image_removed', 'product', $3)", [req.user.businessId, req.user.id, id])
+    return prior
+  }, { businessId: req.user.businessId })
+  if (rows[0].product_image_storage_key) await cleanupStoredImage(rows[0].product_image_storage_key)
+  res.status(204).end()
 }))
 
 api.post('/products/:id/restock', authenticate, requireRole('business_admin'), tenantRoute(async (req, res, client) => {
@@ -1969,7 +2390,7 @@ api.post('/products/:id/restock', authenticate, requireRole('business_admin'), t
   const { rows } = await client.query(
     `UPDATE products SET quantity = quantity + $1, updated_at = now()
     WHERE id = $2 AND status = 'active'
-    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency`,
+    RETURNING id, name, sku, description, buying_price, selling_price, quantity, reorder_level, status, category_id, currency, image_url, product_image_updated_at`,
     [quantity, id],
   )
   if (!rows[0]) throw new HttpError(404, 'Active product not found.')
@@ -3173,22 +3594,42 @@ export function createApiApp() {
         .split(',')
         .map((origin) => origin.trim())
         .filter(Boolean)
+      if (process.env.VERCEL_URL) allowedOrigins.push(`https://${process.env.VERCEL_URL}`)
       if (!allowedOrigins.includes(req.get('origin'))) return res.status(403).json({ error: 'Request origin is not allowed.' })
       const hasBody = Number(req.get('content-length') || 0) > 0 || Boolean(req.get('transfer-encoding'))
       const isBusinessLogoUpload = req.method === 'PUT'
         && req.path === '/api/business/logo'
         && ['image/png', 'image/jpeg', 'image/webp'].includes(req.get('content-type'))
-      if (hasBody && !req.is('application/json') && !isBusinessLogoUpload) {
-        return res.status(415).json({ error: 'Requests must use application/json or a supported business logo image.' })
+      const isProfileImageUpload = req.method === 'PUT'
+        && req.path === '/api/auth/profile-image'
+        && ['image/png', 'image/jpeg', 'image/webp'].includes(req.get('content-type'))
+      const isProductImageUpload = req.method === 'PUT' && req.path.startsWith('/api/products/') && req.path.endsWith('/image')
+        && ['image/png', 'image/jpeg', 'image/webp'].includes(req.get('content-type'))
+      if (hasBody && !req.is('application/json') && !isBusinessLogoUpload && !isProfileImageUpload && !isProductImageUpload) {
+        return res.status(415).json({ error: 'Requests must use application/json or a supported image file.' })
       }
     }
     return next()
   })
+  app.use('/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private')
+    res.set('Pragma', 'no-cache')
+    res.set('Expires', '0')
+    next()
+  })
   app.use('/api', api)
   app.use((req, res) => res.status(404).json({ error: 'API route not found.' }))
-  app.use((error, _req, res, _next) => {
+  app.use((error, req, res, _next) => {
     if (error instanceof HttpError) return res.status(error.status).json({ error: error.message })
-    if (error?.type === 'entity.too.large') return res.status(413).json({ error: 'Business logos must be no larger than 5 MB.' })
+    if (error?.type === 'entity.too.large') {
+      const isProductImage = /^\/api\/products\//.test(req.path)
+      const limitBytes = isProductImage ? maxProductImageBytes : maxImageBytes
+      const limitMb = Math.round(limitBytes / (1024 * 1024))
+      const message = isProductImage
+        ? 'The uploaded file exceeds the configured image size limit.'
+        : `The uploaded image exceeds the ${limitMb} MB size limit.`
+      return res.status(413).json({ error: message })
+    }
     if (error?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Request body must be valid JSON.' })
     if (error?.code === '23505') return res.status(409).json({ error: 'A record with those details already exists.' })
     if (error?.code === '23503' || error?.code === '23514' || error?.code === '22P02') {

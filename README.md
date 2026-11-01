@@ -2,29 +2,44 @@
 
 KAJUNA BMS is a React/Vite business management application. The PostgreSQL schema and migration tooling are in `server/db`.
 
-## PostgreSQL setup
+## Local development (Supabase only)
 
-1. Install Docker Desktop, then copy `.env.example` to `.env`.
-2. Replace both example database passwords with strong, unique values. Generate a separate one-time setup token, for example with `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"`, and set `SETUP_TOKEN` in `.env`. Keep `.env` private; it is ignored by Git.
-3. Start PostgreSQL:
+KAJUNA BMS uses **Supabase PostgreSQL** as its only database. There is no
+Docker container and no local database server to run.
+
+1. Copy `.env.example` to `.env` and fill in your Supabase connection strings
+   and secrets (see `.env.example` and `DEPLOYMENT.md`).
+2. Install dependencies:
 
    ```powershell
-   docker compose up -d postgres
+   npm install
    ```
 
-4. Check the database connection:
+3. Check the database connection:
 
    ```powershell
    npm run db:check
    ```
 
-5. Create the KAJUNA BMS tables and indexes:
+4. Apply database migrations (safe to rerun):
 
    ```powershell
    npm run db:migrate
    ```
 
-The migration command is transactional and safe to rerun. Applied migration versions are recorded in `schema_migrations`. The API session table and initial subscription plan are added by migration `002_auth_sessions`; verified Google identity columns are added by `003_google_authentication`. Migrations `004_money_currencies` and `005_subscription_plan_currency` track the denomination of stored monetary values and subscription plan prices; migration `006_transaction_exchange_snapshots` stores rate and converted-value snapshots for sales and expenses; migration `007_business_approval_management` adds the pending-application review queue indexes; migration `008_business_account_management` adds the suspension reason/status columns and billing query indexes; and migration `010_subscription_period_snapshots` preserves each subscription period's fee and payment-period association.
+5. Start the app (API on 127.0.0.1:3001, Vite on http://localhost:5173):
+
+   ```powershell
+   npm run dev
+   ```
+
+6. Build for production:
+
+   ```powershell
+   npm run build
+   ```
+
+Both localhost and Vercel connect to the SAME Supabase project.
 
 ## Run the application
 
@@ -127,9 +142,11 @@ Rates come from the no-key ExchangeRate-API Open Access endpoint (`https://open.
 
 The backend exposes authenticated endpoints for business setup and profile, account preferences and password changes, products and inventory movements, categories, sales and receipts, expenses, staff accounts, customer debts (customers, debt transactions, payments, and debt/customer reports), dashboard metrics, and subscription status. The Owner Console lists and approves/rejects pending business applications (`/platform/applications`), manages business access and permanent deletion (`/platform/businesses`), reads and updates subscription settings (`/platform/subscription-settings`), and records/verifies payments (`/platform/businesses/:id/payments`, `/platform/payments/:id/verify`). Tenant data is queried through the application database role with transaction-local `app.business_id` context; public business registration is restricted by the existing database policy. Product sales and stock movements are committed atomically.
 
-Business admins can upload or remove a business logo in Business Profile settings. PNG, JPEG, and WebP images up to 5 MB are stored with the business and served only to authenticated users from that business; both business-admin and sales-agent panels display the current business name and logo. Migration `011_business_branding` adds the per-business logo storage.
+Business admins can add an optional product image when creating a product, then replace or remove it from Product stock. PNG, JPEG, and WebP uploads default to 5 MB per image; set `MAX_PRODUCT_IMAGE_BYTES` to change the API limit. Product images are tenant-scoped and appear in inventory, POS catalog cards, and the cart. Migrations `015_product_images` and `016_product_images_in_database` add image metadata and store product image bytes in PostgreSQL. Product images therefore persist across API restarts and serverless instances without a local uploads directory or extra storage credentials. Include PostgreSQL in backups; database storage grows by up to the configured upload limit for each product image. Business logos and profile photos continue to use `IMAGE_STORAGE_DIR` and, when configured, the Supabase Storage adapter described in [Supabase, Vercel, and Namecheap deployment](./DEPLOYMENT.md).
 
-For production, serve the built frontend and proxy `/api` to the Node API on the same origin. Set `APP_ORIGIN` to the public application origin, use HTTPS, keep the setup token and database credentials private, and do not run the API with the schema-owner database credentials.
+Business admins can upload or remove a business logo in Business Profile settings. PNG, JPEG, and WebP images up to 5 MB are stored with the business and served only to authenticated users from that business; both business-admin and sales-agent panels display the current business name and logo. Users in each workspace can upload or remove their own profile photo; profile images are scoped to the authenticated user and shown in the header/sidebar. Migration `011_business_branding` adds logo support and migration `014_persistent_user_images` adds file references for persistent image storage. Image files live in `IMAGE_STORAGE_DIR` (default: `data/images`), separate from PostgreSQL. For Vercel deployments, configure the private Supabase Storage adapter (`IMAGE_STORAGE_PROVIDER=supabase`) and migrate existing image files as described in [Supabase, Vercel, and Namecheap deployment](./DEPLOYMENT.md).
+
+For production, serve the built frontend and proxy `/api` to the Node API on the same origin. Set `APP_ORIGIN` to the public application origin, use HTTPS, keep the setup token and database credentials private, and do not run the API with the schema-owner database credentials. See [Supabase, Vercel, and Namecheap deployment](./DEPLOYMENT.md) for deployment and data-migration steps.
 
 ## Existing UI commands
 

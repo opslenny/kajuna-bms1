@@ -24,6 +24,11 @@ const migrations = [
   ['011_business_branding', new URL('./migrations/011_business_branding.sql', import.meta.url)],
   ['012_user_preferences', new URL('./migrations/012_user_preferences.sql', import.meta.url)],
   ['013_dark_dashboard_default', new URL('./migrations/013_dark_dashboard_default.sql', import.meta.url)],
+  ['014_persistent_user_images', new URL('./migrations/014_persistent_user_images.sql', import.meta.url)],
+  ['015_product_images', new URL('./migrations/015_product_images.sql', import.meta.url)],
+  ['016_product_images_in_database', new URL('./migrations/016_product_images_in_database.sql', import.meta.url)],
+  ['017_rls_performance_optimization', new URL('./migrations/017_rls_performance_optimization.sql', import.meta.url)],
+   ['018_financial_date_indexes', new URL('./migrations/018_financial_date_indexes.sql', import.meta.url)],
 ]
 const pool = new Pool({
   connectionString: migrationConnectionString,

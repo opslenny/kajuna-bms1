@@ -461,6 +461,88 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(agentLogin.payload.user.theme, 'dark')
   assert.equal(agentLogin.payload.user.language, 'en')
   const agentCookie = agentLogin.cookie
+  const logoBytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a2cAAAAASUVORK5CYII=',
+    'base64',
+  )
+  const createdWithImage = await request('/products', { ...json('POST', { name: 'Image on Create', sku: 'API-IMAGE-CREATE', buyingPrice: 5, sellingPrice: 10, quantity: 0 }), cookie: adminCookie })
+  assert.equal(createdWithImage.response.status, 201)
+  const createdImageSave = await requestBinary('/products/' + createdWithImage.payload.product.id + '/image', { method: 'PUT', body: logoBytes, cookie: adminCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(createdImageSave.response.status, 200, 'the create flow saves its image after product details')
+  assert.deepEqual((await requestBinary('/products/' + createdWithImage.payload.product.id + '/image', { cookie: adminCookie })).payload, logoBytes)
+  assert.equal((await requestBinary('/products/' + productId + '/image', { cookie: adminCookie })).response.status, 404)
+  const oversizedProductImage = await requestBinary('/products/' + productId + '/image', { method: 'PUT', body: Buffer.alloc(5 * 1024 * 1024 + 1), cookie: adminCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(oversizedProductImage.response.status, 413, 'product image uploads enforce the configured API size limit')
+  const uploadedProductImage = await requestBinary('/products/' + productId + '/image', { method: 'PUT', body: logoBytes, cookie: adminCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(uploadedProductImage.response.status, 200)
+  assert.ok(uploadedProductImage.payload.imageUpdatedAt)
+  const productImageRead = await requestBinary('/products/' + productId + '/image', { cookie: adminCookie })
+  assert.equal(productImageRead.response.status, 200)
+  assert.equal(productImageRead.response.headers.get('content-type'), 'image/png')
+  assert.deepEqual(productImageRead.payload, logoBytes)
+  const productsWithImages = await request('/products', { cookie: adminCookie })
+  assert.equal(productsWithImages.response.status, 200)
+  const imageProduct = productsWithImages.payload.products.find((product) => product.id === productId)
+  assert.ok(imageProduct?.imageUpdatedAt, 'product listings expose image metadata to the POS data adapter')
+  const { rows: storedProductImage } = await ownerPool.query('SELECT product_image_data, product_image_storage_key FROM products WHERE business_id = $1 AND id = $2', [primaryBusinessId, productId])
+  assert.deepEqual(storedProductImage[0].product_image_data, logoBytes, 'product image bytes persist in PostgreSQL')
+  assert.equal(storedProductImage[0].product_image_storage_key, null, 'new product images do not depend on ephemeral local files')
+  assert.equal(imageProduct.imageUrl, null, 'private image bytes are served from the authenticated product ID endpoint')
+  const productImageInvalid = await requestBinary('/products/' + productId + '/image', { method: 'PUT', body: Buffer.from('not an image'), cookie: adminCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(productImageInvalid.response.status, 400)
+  const productImageDenied = await requestBinary('/products/' + productId + '/image', { method: 'PUT', body: logoBytes, cookie: agentCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(productImageDenied.response.status, 403)
+  const replacedProductImage = await requestBinary('/products/' + productId + '/image', { method: 'PUT', body: logoBytes, cookie: adminCookie, headers: { 'content-type': 'image/png' } })
+  assert.equal(replacedProductImage.response.status, 200)
+  assert.equal((await request('/products/' + productId + '/image', { method: 'DELETE', cookie: adminCookie })).response.status, 204)
+  assert.equal((await requestBinary('/products/' + productId + '/image', { cookie: adminCookie })).response.status, 404)
+  assert.equal(agentLogin.payload.user.profileImageUpdatedAt, null)
+  assert.equal((await requestBinary('/auth/profile-image', { cookie: agentCookie })).response.status, 404,
+    'accounts without a photo use the initials fallback')
+  const unauthenticatedProfileUpload = await requestBinary('/auth/profile-image', {
+    method: 'PUT', body: logoBytes, headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(unauthenticatedProfileUpload.response.status, 401, 'profile image uploads require authentication')
+  const uploadedAgentProfile = await requestBinary('/auth/profile-image', {
+    method: 'PUT', body: logoBytes, cookie: agentCookie, headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(uploadedAgentProfile.response.status, 200)
+  assert.ok(uploadedAgentProfile.payload.profileImageUpdatedAt)
+  const { rows: agentImageReference } = await ownerPool.query(
+    'SELECT profile_image_storage_key, profile_image_mime_type FROM users WHERE id = $1',
+    [agent.id],
+  )
+  assert.match(agentImageReference[0].profile_image_storage_key, new RegExp(`^users/${agent.id}/`))
+  assert.equal(agentImageReference[0].profile_image_mime_type, 'image/png')
+  const replacedAgentProfile = await requestBinary('/auth/profile-image', {
+    method: 'PUT', body: logoBytes, cookie: agentCookie, headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(replacedAgentProfile.response.status, 200, 'users can replace their profile image')
+  assert.equal((await requestBinary('/auth/profile-image', { cookie: agentCookie })).response.status, 200)
+  assert.deepEqual((await requestBinary('/auth/profile-image', { cookie: agentCookie })).payload, logoBytes)
+  const renewedAgentLogin = await request('/auth/login', {
+    ...json('POST', { email: agent.email, password: 'api-agent-password-123' }),
+  })
+  assert.equal(renewedAgentLogin.response.status, 200)
+  assert.ok(renewedAgentLogin.payload.user.profileImageUpdatedAt, 'profile image reference survives a new login')
+  assert.deepEqual((await requestBinary('/auth/profile-image', { cookie: renewedAgentLogin.cookie })).payload, logoBytes)
+  const invalidProfile = await requestBinary('/auth/profile-image', {
+    method: 'PUT', body: Buffer.from('not an image'), cookie: agentCookie,
+    headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(invalidProfile.response.status, 400, 'profile image uploads validate the file signature')
+  const adminProfileUpload = await requestBinary('/auth/profile-image?userId=' + encodeURIComponent(agent.id), {
+    method: 'PUT', body: logoBytes, cookie: adminCookie, headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(adminProfileUpload.response.status, 200)
+  assert.deepEqual((await requestBinary('/auth/profile-image', { cookie: agentCookie })).payload, logoBytes,
+    'profile image updates always apply to the authenticated user, not a supplied user ID')
+  const oversizedProfile = await requestBinary('/auth/profile-image', {
+    method: 'PUT', body: Buffer.alloc(5 * 1024 * 1024 + 1), cookie: agentCookie,
+    headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(oversizedProfile.response.status, 413, 'profile images are limited to 5 MB')
+  await request('/auth/profile-image', { method: 'DELETE', cookie: adminCookie })
   const agentPreferenceUpdate = await request('/auth/preferences', {
     ...json('PATCH', { language: 'sw' }),
     cookie: agentCookie,
@@ -474,10 +556,6 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(newAdminSession.payload.user.theme, 'dark')
   assert.equal(newAdminSession.payload.user.language, 'sw')
   assert.equal((await request('/dashboard', { cookie: agentCookie })).response.status, 403)
-  const logoBytes = Buffer.from(
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a2cAAAAASUVORK5CYII=',
-    'base64',
-  )
   assert.equal((await requestBinary('/business/logo', {
     method: 'PUT',
     body: logoBytes,
@@ -504,6 +582,13 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   })
   assert.equal(savedLogo.response.status, 200, JSON.stringify(savedLogo.payload))
   assert.ok(savedLogo.payload.logoUpdatedAt)
+  const { rows: businessImageReference } = await ownerPool.query(
+    'SELECT logo_storage_key, logo_storage_mime_type, logo_data FROM businesses WHERE id = $1',
+    [primaryBusinessId],
+  )
+  assert.match(businessImageReference[0].logo_storage_key, new RegExp(`^businesses/${primaryBusinessId}/`))
+  assert.equal(businessImageReference[0].logo_storage_mime_type, 'image/png')
+  assert.equal(businessImageReference[0].logo_data, null, 'new logos are stored as files with database references')
   const adminLogo = await requestBinary('/business/logo', { cookie: adminCookie })
   assert.equal(adminLogo.response.headers.get('content-type'), 'image/png')
   assert.deepEqual(adminLogo.payload, logoBytes)
@@ -521,6 +606,11 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   const removedLogo = await request('/business/logo', { method: 'DELETE', cookie: adminCookie })
   assert.equal(removedLogo.response.status, 204)
   assert.equal((await requestBinary('/business/logo', { cookie: agentCookie })).response.status, 404)
+  assert.equal((await request('/auth/me', { cookie: agentCookie })).payload.user.profileImageUpdatedAt !== null, true)
+  const removedAgentProfile = await request('/auth/profile-image', { method: 'DELETE', cookie: agentCookie })
+  assert.equal(removedAgentProfile.response.status, 204)
+  assert.equal((await requestBinary('/auth/profile-image', { cookie: agentCookie })).response.status, 404)
+  assert.equal((await request('/auth/me', { cookie: agentCookie })).payload.user.profileImageUpdatedAt, null)
   const agentSale = await request('/sales', {
     ...json('POST', { items: [{ productId, quantity: 1 }] }),
     cookie: agentCookie,
@@ -553,6 +643,14 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   assert.equal(dashboard.payload.metrics.expenses, 25)
   assert.equal(dashboard.payload.metrics.netProfit, 125)
   assert.equal(dashboard.payload.metrics.cashFlow, 425)
+  assert.deepEqual(dashboard.payload.previousPeriod, {
+    revenue: 0,
+    profit: 0,
+    expenses: 0,
+    netProfit: 0,
+    cashFlow: 0,
+    comparison: 'previous month to date',
+  }, 'dashboard includes an empty previous-month-to-date comparison when there are no prior transactions')
   const initialCashFlow = dashboard.payload.metrics.cashFlow
   assert.equal(dashboard.payload.metrics.todayExpenses, 25)
   assert.equal(dashboard.payload.metrics.productsSold, 3)
@@ -565,6 +663,19 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
     [primaryBusinessId],
   )
   const today = databaseDate[0].today
+  const { rows: previousPeriodDateRows } = await ownerPool.query(
+    'SELECT (timezone(timezone, now())::date - interval \'1 month\')::date::text AS prior_day FROM businesses WHERE id = $1',
+    [primaryBusinessId],
+  )
+  const priorPeriodExpense = await request('/expenses', {
+    ...json('POST', { category: 'Previous period test', description: 'Prior month expense', amount: 20, expenseDate: previousPeriodDateRows[0].prior_day }),
+    cookie: adminCookie,
+  })
+  assert.equal(priorPeriodExpense.response.status, 201)
+  const dashboardWithPriorPeriod = await request('/dashboard', { cookie: adminCookie })
+  assert.equal(dashboardWithPriorPeriod.payload.previousPeriod.expenses, 20)
+  assert.equal(dashboardWithPriorPeriod.payload.previousPeriod.netProfit, -20)
+  assert.equal(dashboardWithPriorPeriod.payload.previousPeriod.cashFlow, -20)
   assert.equal(savedExpense.expense_date, today)
   const datedDashboard = await request(`/dashboard?range=today&date=${today}`, { cookie: adminCookie })
   assert.equal(datedDashboard.payload.chart[0].revenue, 450)
@@ -956,6 +1067,15 @@ test('authentication, tenant isolation, and business workflows use PostgreSQL', 
   })
   assert.equal(secondaryLogin.response.status, 200)
   assert.equal(secondaryLogin.payload.user.role, 'business_admin')
+  const secondaryLogoUpload = await requestBinary('/business/logo', {
+    method: 'PUT', body: logoBytes, cookie: secondaryLogin.cookie,
+    headers: { 'content-type': 'image/png' },
+  })
+  assert.equal(secondaryLogoUpload.response.status, 200)
+  assert.deepEqual((await requestBinary('/business/logo', { cookie: secondaryLogin.cookie })).payload, logoBytes)
+  assert.equal((await requestBinary('/business/logo', { cookie: adminCookie })).response.status, 404,
+    'a business cannot read another business logo')
+  assert.equal((await request('/business/logo', { method: 'DELETE', cookie: secondaryLogin.cookie })).response.status, 204)
   await ownerPool.query(
     `INSERT INTO business_registration_requests
       (business_name, owner_name, email, phone, industry, password_hash, status, reviewed_at)

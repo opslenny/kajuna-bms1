@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "db:check": "node server/db/check.js",
     "db:migrate": "node server/db/migrate.js",
+    "storage:migrate:supabase": "node server/scripts/migrate-images-to-supabase.js",
     "owner:reset-password": "node server/scripts/reset-owner-password.js",
     "test:api": "node server/test-api.js",
     "test": "node server/test-api.js"
@@ -22,6 +23,8 @@
     "express-rate-limit": "^8.7.1",
     "google-auth-library": "^11.2.0",
     "helmet": "^8.3.0",
+    "lucide-react": "^1.55.0",
+    "motion": "^14.1.0",
     "pg": "^8.23.1",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
