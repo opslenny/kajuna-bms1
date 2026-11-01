@@ -2,14 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, useReducedMotion } from 'motion/react'
 import { Boxes, ChartNoAxesCombined, CreditCard, LayoutDashboard, Package, Receipt, RefreshCw, Search, Settings2, ShoppingCart, Users, WalletCards, X } from 'lucide-react'
-import { downloadReportPdf } from './reportPdf.js'
 import './App.css'
 import { translate } from './i18n.js'
 import UnifiedSidebar from './components/UnifiedSidebar.jsx'
 
 const navigation = [
   { title: 'Dashboard', items: ['Overview', 'Performance', 'Reports'] },
-  { title: 'Reports', items: ['Monthly Financial Reports', 'Custom Date-Range Reports', 'Generated Reports'] },
   { title: 'Products', items: ['All Products', 'Add Product', 'Categories'] },
   { title: 'Inventory', items: ['Stock', 'Stock Adjustments', 'Low Stock'] },
   { title: 'Sales', items: ['New Sale / POS', 'Sales History', 'Receipts'] },
@@ -25,9 +23,6 @@ const navigationViews = {
   Overview: 'overview',
   Performance: 'performance',
   Reports: 'transactions',
-  'Monthly Financial Reports': 'overview',
-  'Custom Date-Range Reports': 'overview',
-  'Generated Reports': 'overview',
   'All Products': 'products',
   'Add Product': 'products',
   Categories: 'products',
@@ -708,16 +703,6 @@ function App() {
   const [transactionPage, setTransactionPage] = useState(1)
   const [chartLoading, setChartLoading] = useState(false)
   const [chartError, setChartError] = useState('')
-  const [monthlyReportOpen, setMonthlyReportOpen] = useState(false)
-  const [reportMonth, setReportMonth] = useState(new Date().getMonth() + 1)
-  const [reportYear, setReportYear] = useState(new Date().getFullYear())
-  const [reportData, setReportData] = useState(null)
-  const [reportLoading, setReportLoading] = useState(false)
-  const [reportError, setReportError] = useState('')
-  const [reportDownloading, setReportDownloading] = useState(false)
-  const [reportType, setReportType] = useState('monthly')
-  const [reportCustomStart, setReportCustomStart] = useState(customRangeDefaultStart)
-  const [reportCustomEnd, setReportCustomEnd] = useState(todayDate)
   const [salesDate, setSalesDate] = useState(todayDate)
   const salesDateRef = useRef(todayDate)
   const [showAllSales, setShowAllSales] = useState(false)
@@ -1129,27 +1114,6 @@ function App() {
       setNotice(error.message)
     } finally {
       setChartLoading(false)
-  async function loadMonthlyReport() {
-    setReportLoading(true)
-    setReportError('')
-    try {
-      let url = `/reports/monthly?month=${reportMonth}&year=${reportYear}`
-      if (reportType === 'custom') {
-        url = `/reports/custom?startDate=${reportCustomStart}&endDate=${reportCustomEnd}`
-      }
-      const result = await apiRequest(url)
-      setReportData(result)
-      await downloadReportPdf({ reportData: result, reportType, reportCustomStart, reportCustomEnd, setNotice, setReportError, setReportDownloading })
-      return result
-    } catch (error) {
-      setReportError(error.message)
-      setNotice(error.message)
-    } finally {
-      setReportLoading(false)
-    }
-  }
-
-
     }
   }
 
@@ -1161,18 +1125,6 @@ function App() {
     if (item === 'Add Product') setModal('product')
     if (item === 'Add Expense') setModal('expense')
     if (item === 'Add Customer') setDebtCustomerDialog({ mode: 'create', customer: null })
-    if (item === 'Monthly Financial Reports' || item === 'Generated Reports') {
-      setReportType('monthly')
-      setMonthlyReportOpen(true)
-      setReportData(null)
-      setReportError('')
-    }
-    if (item === 'Custom Date-Range Reports') {
-      setReportType('custom')
-      setMonthlyReportOpen(true)
-      setReportData(null)
-      setReportError('')
-    }
   }
 
   async function loadCustomers(search = '', status = '') {
@@ -2187,95 +2139,7 @@ function App() {
       {adminChangePasswordOpen && (
         <ChangePasswordDialog language={language} onCancel={() => setAdminChangePasswordOpen(false)} onSave={changeOwnPassword} />
       )}
-      {monthlyReportOpen && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setMonthlyReportOpen(false) }}>
-          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="monthly-report-title" style={{ maxWidth: '900px', width: '95%' }}>
-            <div className="modal-heading">
-              <div>
-                <p className="eyebrow">{t('Monthly Financial Report')}</p>
-                <h2 id="monthly-report-title">{t('Generate Monthly Report')}</h2>
-              </div>
-              <button type="button" className="icon-button" onClick={() => setMonthlyReportOpen(false)} aria-label={t('Close')}>×</button>
-            </div>
-            <div className="modal-form">
-              <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap', marginBottom: '12px' }}>
-                {reportType === 'custom' ? (
-                  <>
-                    <label>{t('Start Date')}
-                      <input type="date" value={reportCustomStart} max={reportCustomEnd} onChange={(e) => setReportCustomStart(e.target.value)} />
-                    </label>
-                    <label>{t('End Date')}
-                      <input type="date" value={reportCustomEnd} min={reportCustomStart} onChange={(e) => setReportCustomEnd(e.target.value)} />
-                    </label>
-                  </>
-                ) : (
-                  <>
-                    <label>{t('Month')}
-                      <select value={reportMonth} onChange={(e) => setReportMonth(Number(e.target.value))}>
-                        {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-                          <option key={m} value={m}>{new Date(2000, m - 1, 1).toLocaleString('en', { month: 'long' })}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>{t('Year')}
-                      <input type="number" value={reportYear} onChange={(e) => setReportYear(Number(e.target.value))} min="2000" max="2100" />
-                    </label>
-                  </>
-                )}
-                <button type="button" className="primary-button small" onClick={loadMonthlyReport} disabled={reportLoading || reportDownloading}>{reportLoading ? t('Loading…') : t('Generate Report')}</button>
-              </div>
-              {reportError && <p className="dashboard-chart-error" role="alert">{reportError}</p>}
-              {reportData && (
-                <div id="monthly-report-print" style={{ background: '#fff', color: '#111', padding: '16px', borderRadius: '8px' }}>
-                  <h3>{reportData.business.name}</h3>
-                  <p>{t('Monthly Financial Report')} – {reportData.period.startDay} to {reportData.period.endDay}</p>
-                  <p>{t('Date generated')}: {new Date().toLocaleString()}</p>
-                  <h4>{t('Financial Summary')}</h4>
-                  <ul>
-                    <li>{t('TOTAL REVENUE')}: {formatCurrency(reportData.summary.totalRevenue, reportData.business.currency)}</li>
-                    <li>{t('TOTAL EXPENSES')}: {formatCurrency(reportData.summary.totalExpenses, reportData.business.currency)}</li>
-                    <li>{t('NET PROFIT')}: {formatCurrency(reportData.summary.netProfit, reportData.business.currency)}</li>
-                    <li>{t('CASH')}: {formatCurrency(reportData.summary.cash, reportData.business.currency)}</li>
-                  </ul>
-                  <p>{t('Sales transaction count')}: {reportData.summary.salesCount}</p>
-                  <p>{t('Total sales returns and refunds')}: {formatCurrency(reportData.summary.refundedAmount, reportData.business.currency)} ({reportData.summary.refundedCount})</p>
-                  <p>{t('Profit margin')}: {reportData.summary.profitMargin.toFixed(2)}%</p>
-                  <h4>{t('Expense breakdown by category')}</h4>
-                  <ul>
-                    {reportData.expenseBreakdown.map((e) => (
-                      <li key={e.category}>{e.category}: {formatCurrency(e.amount, reportData.business.currency)} ({e.percentage.toFixed(1)}%, {e.count} tx)</li>
-                    ))}
-                  </ul>
-                  <h4>{t('Payment methods breakdown')}</h4>
-                  <ul>
-                    {reportData.paymentMethods.map((p) => (
-                      <li key={p.method}>{p.method}: {formatCurrency(p.amount, reportData.business.currency)} ({p.count})</li>
-                    ))}
-                  </ul>
-                  <h4>{t('Comparison with previous month')}</h4>
-                  <p>{t('Previous revenue')}: {formatCurrency(reportData.comparison.previousRevenue, reportData.business.currency)}</p>
-                  <p>{t('Previous expenses')}: {formatCurrency(reportData.comparison.previousExpenses, reportData.business.currency)}</p>
-                  <p>{t('Previous net profit')}: {formatCurrency(reportData.comparison.previousNetProfit, reportData.business.currency)}</p>
-                  <h4>{t('Monthly revenue versus expenses')}</h4>
-                  <div style={{ fontSize: '12px' }}>
-                    {reportData.daily.map((d) => (
-                      <div key={d.date}>{d.date}: R {formatCurrency(d.revenue, reportData.business.currency)} / E {formatCurrency(d.expenses, reportData.business.currency)}</div>
-                    ))}
-                  </div>
-                  <p style={{ marginTop: '12px', fontSize: '12px' }}>{t('Generated by the system')}</p>
-                </div>
-              )}
-              {reportData && (
-                <div className="modal-actions">
-                  <button type="button" className="ghost-button" onClick={() => window.print()}>{t('Print')}</button>
-                  <button type="button" className="primary-button" onClick={() => downloadReportPdf({ reportData, reportType, reportCustomStart, reportCustomEnd, setNotice, setReportError, setReportDownloading })} disabled={reportDownloading}>{reportDownloading ? t('Downloading…') : t('Download PDF')}</button>
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
-      )}
-      <UnifiedSidebar
+            <UnifiedSidebar
         id="business-navigation"
         className="sidebar"
         open={mobileNavigationOpen}
@@ -2378,7 +2242,6 @@ function App() {
             </details>
             {selectedView === 'transactions' && <button type="button" className="ghost-button" onClick={exportTransactions}>{t('Export')}</button>}
             {selectedView === 'sales' && <button type="button" className="primary-button" onClick={() => openSection('New Sale / POS')}>{t('+ Add Sale')}</button>}
-            {sessionUser?.role === 'business_admin' && <button type="button" className="ghost-button" onClick={() => { alert('Reports clicked'); setReportType('monthly'); setMonthlyReportOpen(true); setReportData(null); setReportError('') }}>{t('Reports')}</button>}
           </div>
         </header>
 
